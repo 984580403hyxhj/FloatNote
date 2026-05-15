@@ -2058,6 +2058,10 @@ final class MarkdownPreviewView: NSView {
     private var layout: Layout?
     private var sourceMarkdown = ""
 
+    private static let orderedListLineRegex = try? NSRegularExpression(pattern: #"^([ \t]*)(\d+)([.)、])([ \t]*)(.*)$"#)
+    private static let checklistLineRegex = try? NSRegularExpression(pattern: #"^([ \t]*)([-*•])([ \t]+\[[ xX]\][ \t]*)(.*)$"#)
+    private static let bulletLineRegex = try? NSRegularExpression(pattern: #"^([ \t]*)([-*•])([ \t]+)(.*)$"#)
+
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
 
@@ -2226,8 +2230,8 @@ final class MarkdownPreviewView: NSView {
                     lastWasSpacer = true
                 }
             case .text(let textBlock):
-                let attributedText = attributedTextBlock(textBlock)
                 let textWidth = max(80, visibleWidth - outerPadding * 2)
+                let attributedText = attributedTextBlock(textBlock, wrapWidth: textWidth)
                 let measuredHeight = ceil(attributedText.boundingRect(
                     with: NSSize(width: textWidth, height: CGFloat.greatestFiniteMagnitude),
                     options: [.usesLineFragmentOrigin, .usesFontLeading]
@@ -2310,7 +2314,7 @@ final class MarkdownPreviewView: NSView {
         min(max(size * baseFontSize / baseStickerFontSize, minimumStickerFontSize), maximumStickerFontSize + 4)
     }
 
-    private func attributedTextBlock(_ block: MarkdownPreviewTextBlock) -> NSAttributedString {
+    private func attributedTextBlock(_ block: MarkdownPreviewTextBlock, wrapWidth: CGFloat) -> NSAttributedString {
         switch block.style {
         case .heading(let level):
             let size: CGFloat
@@ -2327,8 +2331,115 @@ final class MarkdownPreviewView: NSView {
         case .body:
             let font = NSFont.systemFont(ofSize: scaledFontSize(16), weight: .regular)
             let boldFont = NSFont.systemFont(ofSize: scaledFontSize(16), weight: .semibold)
-            return attributedInlineText(block.text, font: font, boldFont: boldFont, alignment: .left, lineSpacing: 4)
+            let text = NSMutableAttributedString(attributedString: attributedInlineText(block.text, font: font, boldFont: boldFont, alignment: .left, lineSpacing: 4))
+            applyBodyParagraphStyles(to: text, font: font, wrapWidth: wrapWidth)
+            return text
         }
+    }
+
+    private func applyBodyParagraphStyles(to attributedText: NSMutableAttributedString, font: NSFont, wrapWidth: CGFloat) {
+        let nsText = attributedText.string as NSString
+        var location = 0
+
+        while location < nsText.length {
+            let paragraphRange = nsText.lineRange(for: NSRange(location: location, length: 0))
+            let line = contentLine(in: nsText, paragraphRange: paragraphRange)
+            attributedText.addAttribute(
+                .paragraphStyle,
+                value: paragraphStyle(forBodyLine: line, font: font, wrapWidth: wrapWidth),
+                range: paragraphRange
+            )
+            location = paragraphRange.location + paragraphRange.length
+        }
+    }
+
+    private func paragraphStyle(forBodyLine line: String, font: NSFont, wrapWidth: CGFloat) -> NSParagraphStyle {
+        let style = NSMutableParagraphStyle()
+        style.lineBreakMode = .byWordWrapping
+        style.lineSpacing = 4
+        style.defaultTabInterval = max(24, measuredWidth(of: "    ", font: font))
+        style.tabStops = []
+        style.firstLineHeadIndent = 0
+        style.headIndent = min(measuredWidth(of: continuationPrefix(for: line), font: font), max(0, wrapWidth - 48))
+        return style
+    }
+
+    private func continuationPrefix(for line: String) -> String {
+        let nsLine = line as NSString
+        let fullRange = NSRange(location: 0, length: nsLine.length)
+
+        if let regex = Self.orderedListLineRegex,
+           let match = regex.firstMatch(in: line, range: fullRange),
+           match.numberOfRanges == 6 {
+            return [
+                nsLine.substring(with: match.range(at: 1)),
+                nsLine.substring(with: match.range(at: 2)),
+                nsLine.substring(with: match.range(at: 3)),
+                nsLine.substring(with: match.range(at: 4))
+            ].joined()
+        }
+
+        if let regex = Self.checklistLineRegex,
+           let match = regex.firstMatch(in: line, range: fullRange),
+           match.numberOfRanges == 5 {
+            return [
+                nsLine.substring(with: match.range(at: 1)),
+                nsLine.substring(with: match.range(at: 2)),
+                nsLine.substring(with: match.range(at: 3))
+            ].joined()
+        }
+
+        if let regex = Self.bulletLineRegex,
+           let match = regex.firstMatch(in: line, range: fullRange),
+           match.numberOfRanges == 5 {
+            return [
+                nsLine.substring(with: match.range(at: 1)),
+                nsLine.substring(with: match.range(at: 2)),
+                nsLine.substring(with: match.range(at: 3))
+            ].joined()
+        }
+
+        return leadingWhitespace(in: line)
+    }
+
+    private func contentLine(in text: NSString, paragraphRange: NSRange) -> String {
+        var contentLength = paragraphRange.length
+        while contentLength > 0 {
+            let tail = text.substring(with: NSRange(location: paragraphRange.location + contentLength - 1, length: 1))
+            if tail == "\n" || tail == "\r" {
+                contentLength -= 1
+            } else {
+                break
+            }
+        }
+
+        return text.substring(with: NSRange(location: paragraphRange.location, length: contentLength))
+    }
+
+    private func leadingWhitespace(in line: String) -> String {
+        var indent = ""
+        for character in line {
+            if character == " " || character == "\t" {
+                indent.append(character)
+            } else {
+                break
+            }
+        }
+        return indent
+    }
+
+    private func measuredWidth(of prefix: String, font: NSFont) -> CGFloat {
+        guard !prefix.isEmpty else {
+            return 0
+        }
+
+        let attributes: [NSAttributedString.Key: Any] = [.font: font]
+        var width: CGFloat = 0
+        for character in prefix {
+            let printable = character == "\t" ? "    " : String(character)
+            width += (printable as NSString).size(withAttributes: attributes).width
+        }
+        return ceil(width)
     }
 
     private func attributedInlineText(_ text: String, font: NSFont, boldFont: NSFont, alignment: MarkdownTableAlignment, lineSpacing: CGFloat = 2) -> NSAttributedString {
