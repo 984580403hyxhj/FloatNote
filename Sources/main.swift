@@ -1877,6 +1877,135 @@ private struct MarkdownPreviewTable {
     let rows: [[String]]
 }
 
+private enum MarkdownPipeTableParser {
+    static func parseTable(lines: [String], start: Int) -> (table: MarkdownPreviewTable, nextIndex: Int)? {
+        guard start + 1 < lines.count,
+              isTableRow(lines[start]),
+              isSeparatorLine(lines[start + 1]) else {
+            return nil
+        }
+
+        let headers = cells(in: lines[start]).map { $0.trimmingCharacters(in: .whitespaces) }
+        let separatorCells = cells(in: lines[start + 1])
+        guard headers.count >= 2, separatorCells.count >= 2 else {
+            return nil
+        }
+
+        let columnCount = headers.count
+        var rows: [[String]] = []
+        var index = start + 2
+        while index < lines.count, isTableRow(lines[index]) {
+            rows.append(normalizedCells(cells(in: lines[index]), columnCount: columnCount))
+            index += 1
+        }
+
+        let alignments = (0..<columnCount).map { columnIndex in
+            columnIndex < separatorCells.count ? alignment(for: separatorCells[columnIndex]) : .left
+        }
+
+        return (
+            table: MarkdownPreviewTable(
+                headers: Array(headers.prefix(columnCount)),
+                alignments: alignments,
+                rows: rows
+            ),
+            nextIndex: index
+        )
+    }
+
+    static func isTableRow(_ line: String) -> Bool {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        guard trimmed.contains("|"), !isSeparatorLine(trimmed) else {
+            return false
+        }
+
+        let rowCells = cells(in: trimmed)
+        return rowCells.count >= 2 && rowCells.contains { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+    }
+
+    static func isSeparatorLine(_ line: String) -> Bool {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        guard trimmed.contains("|") else {
+            return false
+        }
+
+        let separatorCells = cells(in: trimmed)
+        guard separatorCells.count >= 2 else {
+            return false
+        }
+
+        return separatorCells.allSatisfy(isSeparatorCell)
+    }
+
+    static func cells(in line: String) -> [String] {
+        var trimmed = line.trimmingCharacters(in: .whitespaces)[...]
+        if trimmed.first == "|" {
+            trimmed = trimmed.dropFirst()
+        }
+        if trimmed.last == "|" {
+            trimmed = trimmed.dropLast()
+        }
+        return trimmed.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
+    }
+
+    private static func normalizedCells(_ cells: [String], columnCount: Int) -> [String] {
+        var values = cells.map { $0.trimmingCharacters(in: .whitespaces) }
+        if values.count < columnCount {
+            values.append(contentsOf: Array(repeating: "", count: columnCount - values.count))
+        }
+        return Array(values.prefix(columnCount))
+    }
+
+    private static func alignment(for marker: String) -> MarkdownTableAlignment {
+        let visibleCharacters = marker.filter { !$0.isWhitespace }
+        let starts = visibleCharacters.first.map(isAlignmentColon) ?? false
+        let ends = visibleCharacters.last.map(isAlignmentColon) ?? false
+
+        if starts && ends {
+            return .center
+        }
+        if ends {
+            return .right
+        }
+        return .left
+    }
+
+    private static func isSeparatorCell(_ cell: String) -> Bool {
+        let marker = cell.trimmingCharacters(in: .whitespaces)
+        guard !marker.isEmpty else {
+            return false
+        }
+
+        var dashScore = 0
+        for character in marker {
+            if character.isWhitespace || isAlignmentColon(character) {
+                continue
+            }
+            guard let score = separatorDashScore(for: character) else {
+                return false
+            }
+            dashScore += score
+        }
+
+        return dashScore >= 3
+    }
+
+    private static func isAlignmentColon(_ character: Character) -> Bool {
+        character == ":" || character == "："
+    }
+
+    private static func separatorDashScore(for character: Character) -> Int? {
+        switch character {
+        case "-":
+            return 1
+        case "‐", "‑", "‒", "–", "—", "―", "−", "﹘", "﹣", "－", "─", "━":
+            return 2
+        default:
+            return nil
+        }
+    }
+}
+
 private enum MarkdownPreviewBlock {
     case text(MarkdownPreviewTextBlock)
     case table(MarkdownPreviewTable)
@@ -2264,10 +2393,7 @@ final class MarkdownPreviewView: NSView {
                 continue
             }
 
-            if index + 1 < lines.count,
-               isMarkdownTableRow(line),
-               isMarkdownTableSeparator(lines[index + 1]),
-               let parsedTable = parseTable(lines: lines, start: index) {
+            if let parsedTable = MarkdownPipeTableParser.parseTable(lines: lines, start: index) {
                 flushParagraph()
                 blocks.append(.table(parsedTable.table))
                 lastAddedSpacer = false
@@ -2327,101 +2453,6 @@ final class MarkdownPreviewView: NSView {
         return MarkdownPreviewTextBlock(text: content, style: .heading(level: level))
     }
 
-    private func parseTable(lines: [String], start: Int) -> (table: MarkdownPreviewTable, nextIndex: Int)? {
-        guard start + 1 < lines.count else {
-            return nil
-        }
-
-        let headers = markdownTableCells(in: lines[start]).map { String($0).trimmingCharacters(in: .whitespaces) }
-        let alignments = markdownTableCells(in: lines[start + 1]).map { alignment(for: String($0)) }
-        guard headers.count >= 2, alignments.count >= 2 else {
-            return nil
-        }
-
-        let columnCount = headers.count
-        var rows: [[String]] = []
-        var index = start + 2
-        while index < lines.count, isMarkdownTableRow(lines[index]) {
-            rows.append(normalizedCells(markdownTableCells(in: lines[index]), columnCount: columnCount))
-            index += 1
-        }
-
-        let normalizedAlignments = (0..<columnCount).map { columnIndex in
-            columnIndex < alignments.count ? alignments[columnIndex] : .left
-        }
-
-        return (
-            table: MarkdownPreviewTable(
-                headers: Array(headers.prefix(columnCount)),
-                alignments: Array(normalizedAlignments.prefix(columnCount)),
-                rows: rows
-            ),
-            nextIndex: index
-        )
-    }
-
-    private func normalizedCells(_ cells: [Substring], columnCount: Int) -> [String] {
-        var values = cells.map { String($0).trimmingCharacters(in: .whitespaces) }
-        if values.count < columnCount {
-            values.append(contentsOf: Array(repeating: "", count: columnCount - values.count))
-        }
-        return Array(values.prefix(columnCount))
-    }
-
-    private func alignment(for marker: String) -> MarkdownTableAlignment {
-        let trimmed = marker.trimmingCharacters(in: .whitespaces)
-        let starts = trimmed.hasPrefix(":")
-        let ends = trimmed.hasSuffix(":")
-        if starts && ends {
-            return .center
-        }
-        if ends {
-            return .right
-        }
-        return .left
-    }
-
-    private func isMarkdownTableRow(_ line: String) -> Bool {
-        let trimmed = line.trimmingCharacters(in: .whitespaces)
-        guard trimmed.contains("|"), !isMarkdownTableSeparator(trimmed) else {
-            return false
-        }
-
-        return markdownTableCells(in: trimmed).count >= 2
-    }
-
-    private func isMarkdownTableSeparator(_ line: String) -> Bool {
-        let trimmed = line.trimmingCharacters(in: .whitespaces)
-        guard trimmed.contains("|") else {
-            return false
-        }
-
-        let cells = markdownTableCells(in: trimmed)
-        guard cells.count >= 2 else {
-            return false
-        }
-
-        return cells.allSatisfy { cell in
-            let marker = cell.trimmingCharacters(in: .whitespaces)
-            guard marker.count >= 3 else {
-                return false
-            }
-
-            let core = marker.trimmingCharacters(in: CharacterSet(charactersIn: ":"))
-            return core.count >= 3 && core.allSatisfy { $0 == "-" }
-        }
-    }
-
-    private func markdownTableCells(in line: String) -> [Substring] {
-        var trimmed = line.trimmingCharacters(in: .whitespaces)[...]
-        if trimmed.first == "|" {
-            trimmed = trimmed.dropFirst()
-        }
-        if trimmed.last == "|" {
-            trimmed = trimmed.dropLast()
-        }
-        return trimmed.split(separator: "|", omittingEmptySubsequences: false)
-    }
 }
 
 final class StickerTextView: NSTextView {
@@ -2852,15 +2883,15 @@ final class StickerTextView: NSTextView {
         var index = 0
 
         while index < lines.count - 1 {
-            guard isMarkdownTableRow(lines[index].content),
-                  isMarkdownTableSeparator(lines[index + 1].content) else {
+            guard MarkdownPipeTableParser.isTableRow(lines[index].content),
+                  MarkdownPipeTableParser.isSeparatorLine(lines[index + 1].content) else {
                 index += 1
                 continue
             }
 
             let startIndex = index
             var endIndex = index + 1
-            while endIndex + 1 < lines.count && isMarkdownTableRow(lines[endIndex + 1].content) {
+            while endIndex + 1 < lines.count && MarkdownPipeTableParser.isTableRow(lines[endIndex + 1].content) {
                 endIndex += 1
             }
 
@@ -2893,53 +2924,6 @@ final class StickerTextView: NSTextView {
         }
 
         return records
-    }
-
-    private func isMarkdownTableRow(_ line: String) -> Bool {
-        let trimmed = line.trimmingCharacters(in: .whitespaces)
-        guard trimmed.contains("|"), !isMarkdownTableSeparator(trimmed) else {
-            return false
-        }
-
-        return markdownTableCellCount(in: trimmed) >= 2
-    }
-
-    private func isMarkdownTableSeparator(_ line: String) -> Bool {
-        let trimmed = line.trimmingCharacters(in: .whitespaces)
-        guard trimmed.contains("|") else {
-            return false
-        }
-
-        let cells = markdownTableCells(in: trimmed)
-        guard cells.count >= 2 else {
-            return false
-        }
-
-        return cells.allSatisfy { cell in
-            let marker = cell.trimmingCharacters(in: .whitespaces)
-            guard marker.count >= 3 else {
-                return false
-            }
-
-            let core = marker.trimmingCharacters(in: CharacterSet(charactersIn: ":"))
-            return core.count >= 3 && core.allSatisfy { $0 == "-" }
-        }
-    }
-
-    private func markdownTableCellCount(in line: String) -> Int {
-        markdownTableCells(in: line).count
-    }
-
-    private func markdownTableCells(in line: String) -> [Substring] {
-        var trimmed = line.trimmingCharacters(in: .whitespaces)[...]
-        if trimmed.first == "|" {
-            trimmed = trimmed.dropFirst()
-        }
-        if trimmed.last == "|" {
-            trimmed = trimmed.dropLast()
-        }
-
-        return trimmed.split(separator: "|", omittingEmptySubsequences: false)
     }
 
     private func measuredTableWidth(of line: String) -> CGFloat {
