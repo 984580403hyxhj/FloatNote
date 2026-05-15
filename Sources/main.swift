@@ -20,6 +20,11 @@ private let maximumStickerFontSize: CGFloat = 28
 private let minimumStickerZoomScale: CGFloat = 0.38
 private let maximumStickerZoomScale: CGFloat = 1.80
 
+private enum StickerInteractionMode {
+    case display
+    case editing
+}
+
 fileprivate struct StoredSticker: Codable {
     let id: UUID
     let x: Double
@@ -939,6 +944,99 @@ final class HideMenuView: NSView {
     }
 }
 
+private final class StickerModeButton: NSButton {
+    var mode: StickerInteractionMode = .display {
+        didSet {
+            toolTip = mode == .display ? "Edit" : "Done"
+            needsDisplay = true
+        }
+    }
+
+    private var isHovering = false {
+        didSet { needsDisplay = true }
+    }
+    private var trackingAreaToken: NSTrackingArea?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        isBordered = false
+        title = ""
+        wantsLayer = true
+        toolTip = "Edit"
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        true
+    }
+
+    override func updateTrackingAreas() {
+        if let trackingAreaToken {
+            removeTrackingArea(trackingAreaToken)
+        }
+
+        let trackingArea = NSTrackingArea(
+            rect: bounds,
+            options: [.activeAlways, .mouseEnteredAndExited, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(trackingArea)
+        trackingAreaToken = trackingArea
+        super.updateTrackingAreas()
+    }
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .pointingHand)
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        isHovering = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isHovering = false
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let rect = bounds.insetBy(dx: 0.5, dy: 0.5)
+        let path = NSBezierPath(roundedRect: rect, xRadius: rect.height / 2, yRadius: rect.height / 2)
+        let isDoneMode = mode == .editing
+        let baseColor = isDoneMode
+            ? NSColor(calibratedRed: 0.23, green: 0.50, blue: 0.28, alpha: 0.96)
+            : NSColor(calibratedRed: 0.96, green: 0.78, blue: 0.25, alpha: 0.88)
+        let hoverColor = isDoneMode
+            ? NSColor(calibratedRed: 0.18, green: 0.43, blue: 0.23, alpha: 1.0)
+            : NSColor(calibratedRed: 1.00, green: 0.84, blue: 0.34, alpha: 0.96)
+        (isHovering || isHighlighted ? hoverColor : baseColor).setFill()
+        path.fill()
+
+        let strokeColor = isDoneMode
+            ? NSColor(calibratedRed: 0.07, green: 0.24, blue: 0.10, alpha: 0.36)
+            : NSColor(calibratedRed: 0.48, green: 0.35, blue: 0.08, alpha: 0.30)
+        strokeColor.setStroke()
+        path.lineWidth = 1
+        path.stroke()
+
+        let label = isDoneMode ? "Done" : "Edit"
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .center
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 11.5, weight: .semibold),
+            .foregroundColor: isDoneMode ? NSColor.white : NSColor(calibratedRed: 0.24, green: 0.17, blue: 0.04, alpha: 0.95),
+            .paragraphStyle: paragraph
+        ]
+        let textSize = (label as NSString).size(withAttributes: attributes)
+        (label as NSString).draw(
+            in: NSRect(x: rect.minX, y: rect.midY - textSize.height / 2 - 0.5, width: rect.width, height: textSize.height + 2),
+            withAttributes: attributes
+        )
+    }
+}
+
 final class ZoomControlView: NSView {
     var onZoomOut: (() -> Void)?
     var onReset: (() -> Void)?
@@ -1164,7 +1262,6 @@ final class StickerWindow: NSPanel {
         stickerView.onTextChanged = { [weak self] in self?.onChange?() }
         contentView = stickerView
         self.stickerView = stickerView
-        initialFirstResponder = stickerView.editor
 
         NotificationCenter.default.addObserver(
             self,
@@ -1194,7 +1291,7 @@ final class StickerWindow: NSPanel {
     override var canBecomeMain: Bool { true }
 
     func focusEditor() {
-        stickerView?.focusForPresentation()
+        stickerView?.focusEditor()
     }
 
     fileprivate func notifyPresentationFinished() {
@@ -1219,8 +1316,10 @@ final class StickerView: NSView, NSTextViewDelegate {
     private let previewScrollView = NSScrollView()
     private let previewView = MarkdownPreviewView()
     private let zoomControl = ZoomControlView(frame: NSRect(x: 14, y: 0, width: 116, height: 26))
+    private let modeButton = StickerModeButton(frame: NSRect(x: 0, y: 0, width: 54, height: 22))
     private(set) var zoomScale: CGFloat
-    private var prefersPreviewWhenAvailable = true
+    private var interactionMode: StickerInteractionMode = .editing
+    private var isChangingInteractionMode = false
 
     private let backgroundColor = NSColor(calibratedRed: 1.00, green: 0.97, blue: 0.76, alpha: 0.98)
     private let headerTopColor = NSColor(calibratedRed: 1.00, green: 0.91, blue: 0.48, alpha: 0.72)
@@ -1234,7 +1333,7 @@ final class StickerView: NSView, NSTextViewDelegate {
         buildView()
         editor.string = text
         editor.refreshParagraphLayoutPreservingSelection()
-        updatePreviewMode()
+        setInteractionMode(.display, focusEditor: false)
     }
 
     required init?(coder: NSCoder) {
@@ -1290,7 +1389,7 @@ final class StickerView: NSView, NSTextViewDelegate {
         header.autoresizingMask = [.width, .minYMargin]
         addSubview(header)
 
-        let closeButton = NSButton(frame: NSRect(x: bounds.width - 36, y: bounds.height - 27, width: 22, height: 22))
+        let closeButton = NSButton(frame: NSRect(x: bounds.width - 30, y: bounds.height - 26, width: 18, height: 18))
         closeButton.autoresizingMask = [.minXMargin, .minYMargin]
         closeButton.title = "x"
         closeButton.font = .systemFont(ofSize: 13, weight: .semibold)
@@ -1300,6 +1399,12 @@ final class StickerView: NSView, NSTextViewDelegate {
         closeButton.target = self
         closeButton.action = #selector(closeSticker)
         addSubview(closeButton)
+
+        modeButton.frame.origin = NSPoint(x: bounds.width - 88, y: bounds.height - 28)
+        modeButton.autoresizingMask = [.minXMargin, .minYMargin]
+        modeButton.target = self
+        modeButton.action = #selector(toggleInteractionMode)
+        addSubview(modeButton)
 
         zoomControl.frame.origin.y = bounds.height - 29
         zoomControl.autoresizingMask = [.maxXMargin, .minYMargin]
@@ -1345,8 +1450,8 @@ final class StickerView: NSView, NSTextViewDelegate {
         editor.onZoomIn = { [weak self] in self?.zoomIn() }
         editor.onZoomOut = { [weak self] in self?.zoomOut() }
         editor.onZoomReset = { [weak self] in self?.resetZoom() }
-        editor.onRequestPreview = { [weak self] in
-            self?.showPreviewIfAvailable()
+        editor.onFinishEditing = { [weak self] in
+            self?.showDisplay()
         }
         editor.textContainer?.containerSize = NSSize(width: scrollView.bounds.width, height: CGFloat.greatestFiniteMagnitude)
         editor.textContainer?.widthTracksTextView = true
@@ -1437,7 +1542,7 @@ final class StickerView: NSView, NSTextViewDelegate {
         editor.minSize = NSSize(width: 0, height: max(0, scrollView.contentSize.height))
         editor.setFrameSize(NSSize(width: documentWidth, height: documentHeight))
         editor.refreshParagraphLayoutPreservingSelection()
-        updatePreviewMode()
+        updateDisplayLayout()
     }
 
     private func updateTypography() {
@@ -1460,19 +1565,11 @@ final class StickerView: NSView, NSTextViewDelegate {
     }
 
     func focusEditor() {
-        prefersPreviewWhenAvailable = false
-        previewScrollView.isHidden = true
-        scrollView.isHidden = false
-        window?.makeFirstResponder(editor)
+        setInteractionMode(.editing, focusEditor: true)
     }
 
-    func focusForPresentation() {
-        prefersPreviewWhenAvailable = true
-        if showPreviewIfAvailable() {
-            return
-        }
-
-        focusEditor()
+    func showDisplay() {
+        setInteractionMode(.display, focusEditor: false)
     }
 
     override func magnify(with event: NSEvent) {
@@ -1508,6 +1605,15 @@ final class StickerView: NSView, NSTextViewDelegate {
 
     @objc private func closeSticker() {
         onClose?()
+    }
+
+    @objc private func toggleInteractionMode() {
+        switch interactionMode {
+        case .display:
+            focusEditor()
+        case .editing:
+            showDisplay()
+        }
     }
 
     func textView(_ textView: NSTextView, shouldChangeTextIn affectedCharRange: NSRange, replacementString: String?) -> Bool {
@@ -1667,50 +1773,74 @@ final class StickerView: NSView, NSTextViewDelegate {
     }
 
     func textDidBeginEditing(_ notification: Notification) {
-        previewScrollView.isHidden = true
-        scrollView.isHidden = false
+        guard !isChangingInteractionMode else { return }
+        setInteractionMode(.editing, focusEditor: false)
     }
 
     func textDidEndEditing(_ notification: Notification) {
-        showPreviewAfterEditing()
+        guard !isChangingInteractionMode else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self,
+                  self.interactionMode == .editing,
+                  self.window?.firstResponder !== self.editor else {
+                return
+            }
+            self.showDisplay()
+        }
     }
 
-    private func updatePreviewMode() {
+    private func updateDisplayLayout() {
         let visibleWidth = max(0, previewScrollView.contentSize.width)
         guard visibleWidth > 0 else {
             return
         }
 
-        if let previewSize = previewView.configure(markdown: editor.string, visibleWidth: visibleWidth) {
-            previewView.setFrameSize(previewSize)
-            previewScrollView.isHidden = !prefersPreviewWhenAvailable
-            scrollView.isHidden = prefersPreviewWhenAvailable
-        } else {
+        let previewSize = previewView.configure(markdown: editor.string, visibleWidth: visibleWidth)
+        previewView.setFrameSize(previewSize)
+
+        guard interactionMode == .display else {
             previewScrollView.isHidden = true
             scrollView.isHidden = false
-            prefersPreviewWhenAvailable = false
-        }
-    }
-
-    @discardableResult
-    private func showPreviewIfAvailable() -> Bool {
-        let visibleWidth = max(0, previewScrollView.contentSize.width)
-        guard visibleWidth > 0,
-              let previewSize = previewView.configure(markdown: editor.string, visibleWidth: visibleWidth) else {
-            return false
+            return
         }
 
-        prefersPreviewWhenAvailable = true
-        previewView.setFrameSize(previewSize)
-        scrollView.isHidden = true
         previewScrollView.isHidden = false
-        window?.makeFirstResponder(previewView)
-        return true
+        scrollView.isHidden = true
     }
 
     func showPreviewAfterEditing() {
-        prefersPreviewWhenAvailable = true
-        updatePreviewMode()
+        showDisplay()
+    }
+
+    private func setInteractionMode(_ mode: StickerInteractionMode, focusEditor shouldFocusEditor: Bool) {
+        if interactionMode == mode, !(mode == .editing && shouldFocusEditor) {
+            updateDisplayLayout()
+            return
+        }
+
+        isChangingInteractionMode = true
+        interactionMode = mode
+        modeButton.mode = mode
+
+        switch mode {
+        case .display:
+            editor.isEditable = false
+            editor.isSelectable = true
+            updateDisplayLayout()
+            scrollView.isHidden = true
+            previewScrollView.isHidden = false
+            window?.makeFirstResponder(previewView)
+        case .editing:
+            editor.isEditable = true
+            editor.isSelectable = true
+            previewScrollView.isHidden = true
+            scrollView.isHidden = false
+            if shouldFocusEditor {
+                window?.makeFirstResponder(editor)
+            }
+        }
+
+        isChangingInteractionMode = false
     }
 }
 
@@ -1731,11 +1861,26 @@ private enum MarkdownTableAlignment {
     }
 }
 
+private enum MarkdownPreviewTextStyle {
+    case heading(level: Int)
+    case body
+}
+
+private struct MarkdownPreviewTextBlock {
+    let text: String
+    let style: MarkdownPreviewTextStyle
+}
+
 private struct MarkdownPreviewTable {
-    let title: String?
     let headers: [String]
     let alignments: [MarkdownTableAlignment]
     let rows: [[String]]
+}
+
+private enum MarkdownPreviewBlock {
+    case text(MarkdownPreviewTextBlock)
+    case table(MarkdownPreviewTable)
+    case spacer
 }
 
 final class MarkdownPreviewView: NSView {
@@ -1743,22 +1888,36 @@ final class MarkdownPreviewView: NSView {
     var backgroundFillColor = NSColor(calibratedRed: 1.00, green: 0.97, blue: 0.76, alpha: 0.98)
     var baseFontSize: CGFloat = baseStickerFontSize
 
-    private struct Layout {
+    private struct TextLayout {
+        let attributedText: NSAttributedString
+        let rect: NSRect
+    }
+
+    private struct TableLayout {
         let table: MarkdownPreviewTable
-        let title: NSAttributedString?
         let columnWidths: [CGFloat]
         let headerCells: [NSAttributedString]
         let rowCells: [[NSAttributedString]]
         let rowHeights: [CGFloat]
-        let tableOrigin: NSPoint
-        let tableWidth: CGFloat
+        let tableFrame: NSRect
+    }
+
+    private enum BlockLayout {
+        case text(TextLayout)
+        case table(TableLayout)
+    }
+
+    private struct Layout {
+        let blocks: [BlockLayout]
         let size: NSSize
     }
 
     private let outerPadding: CGFloat = 16
     private let cellHorizontalPadding: CGFloat = 14
     private let cellVerticalPadding: CGFloat = 14
-    private let titleBottomGap: CGFloat = 18
+    private let textBlockGap: CGFloat = 12
+    private let tableBlockGap: CGFloat = 16
+    private let spacerHeight: CGFloat = 8
     private let minimumHeaderHeight: CGFloat = 28
     private let minimumBodyHeight: CGFloat = 34
     private let maximumRegularColumnWidth: CGFloat = 210
@@ -1768,6 +1927,7 @@ final class MarkdownPreviewView: NSView {
     private let textColor = NSColor(calibratedRed: 0.06, green: 0.07, blue: 0.08, alpha: 1.0)
 
     private var layout: Layout?
+    private var sourceMarkdown = ""
 
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
@@ -1782,25 +1942,70 @@ final class MarkdownPreviewView: NSView {
         nil
     }
 
-    func configure(markdown: String, visibleWidth: CGFloat) -> NSSize? {
-        guard let table = parseTable(from: markdown) else {
-            layout = nil
-            needsDisplay = true
-            return nil
-        }
-
-        let layout = makeLayout(for: table, visibleWidth: visibleWidth)
+    func configure(markdown: String, visibleWidth: CGFloat) -> NSSize {
+        sourceMarkdown = markdown
+        let blocks = parseBlocks(from: markdown)
+        let layout = makeLayout(for: blocks, visibleWidth: max(visibleWidth, 160))
         self.layout = layout
         needsDisplay = true
         return layout.size
     }
 
     override func mouseDown(with event: NSEvent) {
-        onBeginEditing?()
+        window?.makeFirstResponder(self)
     }
 
     override func rightMouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard flags.contains(.command),
+              let key = event.charactersIgnoringModifiers?.lowercased() else {
+            super.keyDown(with: event)
+            return
+        }
+
+        if key == "e" {
+            onBeginEditing?()
+            return
+        }
+
+        if key == "c" {
+            copyAll()
+            return
+        }
+
+        super.keyDown(with: event)
+    }
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let menu = NSMenu()
+        let editItem = NSMenuItem(title: "Edit", action: #selector(beginEditingFromMenu), keyEquivalent: "")
+        editItem.target = self
+        menu.addItem(editItem)
+
+        let copyItem = NSMenuItem(title: "Copy All", action: #selector(copyAllFromMenu), keyEquivalent: "")
+        copyItem.target = self
+        copyItem.isEnabled = !sourceMarkdown.isEmpty
+        menu.addItem(copyItem)
+        return menu
+    }
+
+    @objc private func beginEditingFromMenu() {
         onBeginEditing?()
+    }
+
+    @objc private func copyAllFromMenu() {
+        copyAll()
+    }
+
+    private func copyAll() {
+        guard !sourceMarkdown.isEmpty else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(sourceMarkdown, forType: .string)
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -1811,42 +2016,40 @@ final class MarkdownPreviewView: NSView {
         backgroundFillColor.setFill()
         NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 7, yRadius: 7).fill()
 
-        if let title = layout.title {
-            title.draw(with: NSRect(
-                x: outerPadding,
-                y: outerPadding - 2,
-                width: max(0, layout.size.width - outerPadding * 2),
-                height: 38
-            ), options: [.usesLineFragmentOrigin, .usesFontLeading])
+        for block in layout.blocks {
+            switch block {
+            case .text(let textLayout):
+                textLayout.attributedText.draw(with: textLayout.rect, options: [.usesLineFragmentOrigin, .usesFontLeading])
+            case .table(let tableLayout):
+                drawTable(tableLayout)
+            }
         }
-
-        drawTable(layout)
     }
 
-    private func drawTable(_ layout: Layout) {
-        let x = layout.tableOrigin.x
-        var y = layout.tableOrigin.y
+    private func drawTable(_ layout: TableLayout) {
+        let x = layout.tableFrame.minX
+        var y = layout.tableFrame.minY
 
         backgroundFillColor.setFill()
-        NSBezierPath(rect: NSRect(x: x, y: y, width: layout.tableWidth, height: layout.rowHeights.reduce(0, +))).fill()
+        NSBezierPath(rect: layout.tableFrame).fill()
 
-        drawCells(layout.headerCells, columnWidths: layout.columnWidths, rowY: y, rowHeight: layout.rowHeights[0], alignments: layout.table.alignments)
+        drawCells(layout.headerCells, columnWidths: layout.columnWidths, tableX: x, rowY: y, rowHeight: layout.rowHeights[0], alignments: layout.table.alignments)
 
         gridColor.setStroke()
-        drawHorizontalLine(x: x, y: y + layout.rowHeights[0], width: layout.tableWidth, lineWidth: 1.2)
+        drawHorizontalLine(x: x, y: y + layout.rowHeights[0], width: layout.tableFrame.width, lineWidth: 1.2)
         y += layout.rowHeights[0]
 
         for (rowIndex, cells) in layout.rowCells.enumerated() {
             let rowHeight = layout.rowHeights[rowIndex + 1]
-            drawCells(cells, columnWidths: layout.columnWidths, rowY: y, rowHeight: rowHeight, alignments: layout.table.alignments)
+            drawCells(cells, columnWidths: layout.columnWidths, tableX: x, rowY: y, rowHeight: rowHeight, alignments: layout.table.alignments)
             rowGridColor.setStroke()
-            drawHorizontalLine(x: x, y: y + rowHeight, width: layout.tableWidth, lineWidth: 0.8)
+            drawHorizontalLine(x: x, y: y + rowHeight, width: layout.tableFrame.width, lineWidth: 0.8)
             y += rowHeight
         }
     }
 
-    private func drawCells(_ cells: [NSAttributedString], columnWidths: [CGFloat], rowY: CGFloat, rowHeight: CGFloat, alignments: [MarkdownTableAlignment]) {
-        var x = outerPadding
+    private func drawCells(_ cells: [NSAttributedString], columnWidths: [CGFloat], tableX: CGFloat, rowY: CGFloat, rowHeight: CGFloat, alignments: [MarkdownTableAlignment]) {
+        var x = tableX
 
         for index in cells.indices {
             let width = columnWidths[index]
@@ -1875,17 +2078,44 @@ final class MarkdownPreviewView: NSView {
         path.stroke()
     }
 
-    private func makeLayout(for table: MarkdownPreviewTable, visibleWidth: CGFloat) -> Layout {
-        let title = table.title.map { titleText in
-            NSAttributedString(
-                string: titleText,
-                attributes: [
-                    .font: NSFont.systemFont(ofSize: scaledFontSize(24), weight: .bold),
-                    .foregroundColor: textColor
-                ]
-            )
+    private func makeLayout(for blocks: [MarkdownPreviewBlock], visibleWidth: CGFloat) -> Layout {
+        var y = outerPadding
+        var maxContentWidth = visibleWidth
+        var layouts: [BlockLayout] = []
+        var lastWasSpacer = false
+
+        for block in blocks {
+            switch block {
+            case .spacer:
+                if !lastWasSpacer, !layouts.isEmpty {
+                    y += spacerHeight
+                    lastWasSpacer = true
+                }
+            case .text(let textBlock):
+                let attributedText = attributedTextBlock(textBlock)
+                let textWidth = max(80, visibleWidth - outerPadding * 2)
+                let measuredHeight = ceil(attributedText.boundingRect(
+                    with: NSSize(width: textWidth, height: CGFloat.greatestFiniteMagnitude),
+                    options: [.usesLineFragmentOrigin, .usesFontLeading]
+                ).height)
+                let rect = NSRect(x: outerPadding, y: y, width: textWidth, height: measuredHeight + 2)
+                layouts.append(.text(TextLayout(attributedText: attributedText, rect: rect)))
+                y += rect.height + textBlockGap
+                lastWasSpacer = false
+            case .table(let table):
+                let tableLayout = makeTableLayout(for: table, y: y, visibleWidth: visibleWidth)
+                layouts.append(.table(tableLayout))
+                y += tableLayout.tableFrame.height + tableBlockGap
+                maxContentWidth = max(maxContentWidth, tableLayout.tableFrame.maxX + outerPadding)
+                lastWasSpacer = false
+            }
         }
 
+        let contentHeight = layouts.isEmpty ? outerPadding * 2 : max(outerPadding * 2, y - min(textBlockGap, tableBlockGap) + outerPadding)
+        return Layout(blocks: layouts, size: NSSize(width: max(visibleWidth, maxContentWidth), height: contentHeight))
+    }
+
+    private func makeTableLayout(for table: MarkdownPreviewTable, y: CGFloat, visibleWidth: CGFloat) -> TableLayout {
         let headerFont = NSFont.systemFont(ofSize: scaledFontSize(16), weight: .semibold)
         let bodyFont = NSFont.systemFont(ofSize: scaledFontSize(16), weight: .regular)
         let boldBodyFont = NSFont.systemFont(ofSize: scaledFontSize(16), weight: .semibold)
@@ -1917,27 +2147,19 @@ final class MarkdownPreviewView: NSView {
         }
 
         let tableWidth = columnWidths.reduce(0, +)
-        let titleHeight: CGFloat = title == nil ? 0 : 38 + titleBottomGap
-        let tableOrigin = NSPoint(x: outerPadding, y: outerPadding + titleHeight)
 
         var rowHeights = [max(minimumHeaderHeight, measuredRowHeight(cells: headerCells, widths: columnWidths))]
         for row in rowCells {
             rowHeights.append(max(minimumBodyHeight, measuredRowHeight(cells: row, widths: columnWidths)))
         }
 
-        let contentHeight = tableOrigin.y + rowHeights.reduce(0, +) + outerPadding
-        let contentWidth = max(visibleWidth, tableWidth + outerPadding * 2)
-
-        return Layout(
+        return TableLayout(
             table: table,
-            title: title,
             columnWidths: columnWidths,
             headerCells: headerCells,
             rowCells: rowCells,
             rowHeights: rowHeights,
-            tableOrigin: tableOrigin,
-            tableWidth: tableWidth,
-            size: NSSize(width: contentWidth, height: contentHeight)
+            tableFrame: NSRect(x: outerPadding, y: y, width: tableWidth, height: rowHeights.reduce(0, +))
         )
     }
 
@@ -1954,11 +2176,32 @@ final class MarkdownPreviewView: NSView {
         min(max(size * baseFontSize / baseStickerFontSize, minimumStickerFontSize), maximumStickerFontSize + 4)
     }
 
-    private func attributedInlineText(_ text: String, font: NSFont, boldFont: NSFont, alignment: MarkdownTableAlignment) -> NSAttributedString {
+    private func attributedTextBlock(_ block: MarkdownPreviewTextBlock) -> NSAttributedString {
+        switch block.style {
+        case .heading(let level):
+            let size: CGFloat
+            switch level {
+            case 1:
+                size = 24
+            case 2:
+                size = 21
+            default:
+                size = 18
+            }
+            let font = NSFont.systemFont(ofSize: scaledFontSize(size), weight: .bold)
+            return attributedInlineText(block.text, font: font, boldFont: font, alignment: .left, lineSpacing: 3)
+        case .body:
+            let font = NSFont.systemFont(ofSize: scaledFontSize(16), weight: .regular)
+            let boldFont = NSFont.systemFont(ofSize: scaledFontSize(16), weight: .semibold)
+            return attributedInlineText(block.text, font: font, boldFont: boldFont, alignment: .left, lineSpacing: 4)
+        }
+    }
+
+    private func attributedInlineText(_ text: String, font: NSFont, boldFont: NSFont, alignment: MarkdownTableAlignment, lineSpacing: CGFloat = 2) -> NSAttributedString {
         let paragraphStyle = NSMutableParagraphStyle()
         paragraphStyle.alignment = alignment.textAlignment
         paragraphStyle.lineBreakMode = .byWordWrapping
-        paragraphStyle.lineSpacing = 2
+        paragraphStyle.lineSpacing = lineSpacing
 
         let result = NSMutableAttributedString()
         let baseAttributes: [NSAttributedString.Key: Any] = [
@@ -1989,22 +2232,103 @@ final class MarkdownPreviewView: NSView {
         return result
     }
 
-    private func parseTable(from markdown: String) -> MarkdownPreviewTable? {
+    private func parseBlocks(from markdown: String) -> [MarkdownPreviewBlock] {
         let lines = markdown.components(separatedBy: .newlines)
-        guard lines.count >= 2 else {
-            return nil
+        var blocks: [MarkdownPreviewBlock] = []
+        var paragraphLines: [String] = []
+        var lastAddedSpacer = false
+
+        func flushParagraph() {
+            let text = paragraphLines.joined(separator: "\n").trimmingCharacters(in: .newlines)
+            paragraphLines.removeAll()
+            guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return
+            }
+
+            blocks.append(.text(MarkdownPreviewTextBlock(text: text, style: .body)))
+            lastAddedSpacer = false
         }
 
-        var tableStart: Int?
-        for index in 0..<(lines.count - 1) {
-            if isMarkdownTableRow(lines[index]),
-               isMarkdownTableSeparator(lines[index + 1]) {
-                tableStart = index
+        var index = 0
+        while index < lines.count {
+            let line = lines[index]
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+
+            if trimmed.isEmpty {
+                flushParagraph()
+                if !blocks.isEmpty, !lastAddedSpacer {
+                    blocks.append(.spacer)
+                    lastAddedSpacer = true
+                }
+                index += 1
+                continue
+            }
+
+            if index + 1 < lines.count,
+               isMarkdownTableRow(line),
+               isMarkdownTableSeparator(lines[index + 1]),
+               let parsedTable = parseTable(lines: lines, start: index) {
+                flushParagraph()
+                blocks.append(.table(parsedTable.table))
+                lastAddedSpacer = false
+                index = parsedTable.nextIndex
+                continue
+            }
+
+            if let heading = headingBlock(in: trimmed) {
+                flushParagraph()
+                blocks.append(.text(heading))
+                lastAddedSpacer = false
+                index += 1
+                continue
+            }
+
+            paragraphLines.append(line)
+            index += 1
+        }
+
+        flushParagraph()
+        while let last = blocks.last {
+            if case .spacer = last {
+                blocks.removeLast()
+            } else {
                 break
             }
         }
 
-        guard let start = tableStart else {
+        return blocks
+    }
+
+    private func headingBlock(in trimmedLine: String) -> MarkdownPreviewTextBlock? {
+        var level = 0
+        for character in trimmedLine {
+            if character == "#" {
+                level += 1
+            } else {
+                break
+            }
+        }
+
+        guard (1...3).contains(level) else {
+            return nil
+        }
+
+        let contentStart = trimmedLine.index(trimmedLine.startIndex, offsetBy: level)
+        guard contentStart < trimmedLine.endIndex,
+              trimmedLine[contentStart].isWhitespace else {
+            return nil
+        }
+
+        let content = trimmedLine[contentStart...].trimmingCharacters(in: .whitespaces)
+        guard !content.isEmpty else {
+            return nil
+        }
+
+        return MarkdownPreviewTextBlock(text: content, style: .heading(level: level))
+    }
+
+    private func parseTable(lines: [String], start: Int) -> (table: MarkdownPreviewTable, nextIndex: Int)? {
+        guard start + 1 < lines.count else {
             return nil
         }
 
@@ -2022,46 +2346,18 @@ final class MarkdownPreviewView: NSView {
             index += 1
         }
 
-        let title = titleBeforeTable(lines: lines, tableStart: start)
-        let normalizedAlignments = alignments.prefix(columnCount) + Array(repeating: .left, count: max(0, columnCount - alignments.count))
+        let normalizedAlignments = (0..<columnCount).map { columnIndex in
+            columnIndex < alignments.count ? alignments[columnIndex] : .left
+        }
 
-        return MarkdownPreviewTable(
-            title: title,
-            headers: Array(headers.prefix(columnCount)),
-            alignments: Array(normalizedAlignments.prefix(columnCount)),
-            rows: rows
+        return (
+            table: MarkdownPreviewTable(
+                headers: Array(headers.prefix(columnCount)),
+                alignments: Array(normalizedAlignments.prefix(columnCount)),
+                rows: rows
+            ),
+            nextIndex: index
         )
-    }
-
-    private func titleBeforeTable(lines: [String], tableStart: Int) -> String? {
-        guard tableStart > 0 else {
-            return nil
-        }
-
-        var titleLines: [String] = []
-        var index = tableStart - 1
-        while index >= 0 {
-            let trimmed = lines[index].trimmingCharacters(in: .whitespaces)
-            if trimmed.isEmpty {
-                break
-            }
-            titleLines.insert(cleanHeading(trimmed), at: 0)
-            if index == 0 {
-                break
-            }
-            index -= 1
-        }
-
-        let title = titleLines.joined(separator: " ").trimmingCharacters(in: .whitespaces)
-        return title.isEmpty ? nil : title
-    }
-
-    private func cleanHeading(_ text: String) -> String {
-        var cleaned = text
-        while cleaned.hasPrefix("#") {
-            cleaned.removeFirst()
-        }
-        return cleaned.trimmingCharacters(in: .whitespaces)
     }
 
     private func normalizedCells(_ cells: [Substring], columnCount: Int) -> [String] {
@@ -2132,7 +2428,7 @@ final class StickerTextView: NSTextView {
     var onZoomIn: (() -> Void)?
     var onZoomOut: (() -> Void)?
     var onZoomReset: (() -> Void)?
-    var onRequestPreview: (() -> Void)?
+    var onFinishEditing: (() -> Void)?
 
     private struct CaretAnchor {
         let lineIndex: Int
@@ -2161,9 +2457,23 @@ final class StickerTextView: NSTextView {
     }
 
     override func keyDown(with event: NSEvent) {
+        if event.keyCode == 53 {
+            onFinishEditing?()
+            return
+        }
+
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-        guard flags.contains(.command),
-              let key = event.charactersIgnoringModifiers?.lowercased() else {
+        guard let key = event.charactersIgnoringModifiers?.lowercased() else {
+            super.keyDown(with: event)
+            return
+        }
+
+        if flags.contains(.command), event.keyCode == 36 || event.keyCode == 76 {
+            onFinishEditing?()
+            return
+        }
+
+        guard flags.contains(.command) else {
             super.keyDown(with: event)
             return
         }
@@ -2314,7 +2624,6 @@ final class StickerTextView: NSTextView {
         }
 
         insertText(pastedText, replacementRange: selectedRange())
-        onRequestPreview?()
     }
 
     private func selectAllText() {

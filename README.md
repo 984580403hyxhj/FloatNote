@@ -8,7 +8,7 @@ FloatNote is a small native macOS floating sticker app built with Swift and AppK
 - Top-right quick create and hide controls
 - Persisted sticker text, position, size, and zoom
 - Clipboard text as the default content for new stickers
-- Markdown-style list editing and table preview
+- Markdown-style list editing with Display/Edit mode and block-based table preview
 - Resizable stickers with adaptive text scaling
 
 ## Build
