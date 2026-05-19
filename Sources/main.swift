@@ -34,6 +34,7 @@ fileprivate struct StoredSticker: Codable {
     let height: Double
     let text: String
     let zoom: Double?
+    let zIndex: Int?
 }
 
 private final class StickerStorage {
@@ -90,6 +91,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var visibilityState: VisibilityState = .pinned
     private var restoreHotspotRequiresReentry = false
     private var presentationGeneration = 0
+    private var isRestoringStickerWindows = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -163,11 +165,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.onChange = { [weak self] in
             self?.scheduleSave()
         }
+        window.onActivate = { [weak self, weak window] in
+            guard let self, let window else { return }
+            self.bringStickerToFront(window)
+        }
         return window
     }
 
     private func restoreStoredStickers() {
-        let records = storage.load()
+        let records = storage.load().enumerated().sorted { left, right in
+            let leftZIndex = left.element.zIndex ?? left.offset
+            let rightZIndex = right.element.zIndex ?? right.offset
+            if leftZIndex == rightZIndex {
+                return left.offset < right.offset
+            }
+            return leftZIndex < rightZIndex
+        }.map(\.element)
+        isRestoringStickerWindows = true
+        defer { isRestoringStickerWindows = false }
+
         for record in records {
             let window = makeStickerWindow(
                 id: record.id,
@@ -180,6 +196,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if !stickerWindows.isEmpty {
             bubbleWindow?.showPersistentHideMenu()
+            saveStickerState()
         }
     }
 
@@ -202,6 +219,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             width: frame.width,
             height: frame.height
         )
+    }
+
+    private func bringStickerToFront(_ window: StickerWindow) {
+        guard !isRestoringStickerWindows,
+              visibilityState != .hidden,
+              let index = stickerWindows.firstIndex(where: { $0 === window }) else {
+            return
+        }
+
+        if index != stickerWindows.index(before: stickerWindows.endIndex) {
+            stickerWindows.remove(at: index)
+            stickerWindows.append(window)
+        }
+
+        if window.isVisible {
+            window.orderFrontRegardless()
+        }
+        scheduleSave()
     }
 
     private func hideAll() {
@@ -515,7 +550,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func saveStickerState() {
         saveTimer?.invalidate()
         saveTimer = nil
-        storage.save(stickerWindows.map { $0.storedRecord })
+        storage.save(stickerWindows.enumerated().map { index, window in
+            window.storedRecord(zIndex: index)
+        })
     }
 }
 
@@ -1276,11 +1313,12 @@ final class StickerWindow: NSPanel {
     let id: UUID
     var onClose: (() -> Void)?
     var onChange: (() -> Void)?
+    var onActivate: (() -> Void)?
     fileprivate var suppressesFrameChangeNotifications = false
     fileprivate var presentationTargetFrame: NSRect?
     private weak var stickerView: StickerView?
 
-    fileprivate var storedRecord: StoredSticker {
+    fileprivate func storedRecord(zIndex: Int) -> StoredSticker {
         let recordFrame = presentationTargetFrame ?? frame
 
         return StoredSticker(
@@ -1290,7 +1328,8 @@ final class StickerWindow: NSPanel {
             width: Double(recordFrame.width),
             height: Double(recordFrame.height),
             text: stickerView?.editor.string ?? "",
-            zoom: Double(stickerView?.zoomScale ?? 1)
+            zoom: Double(stickerView?.zoomScale ?? 1),
+            zIndex: zIndex
         )
     }
 
@@ -1337,6 +1376,12 @@ final class StickerWindow: NSPanel {
             name: NSWindow.didResignKeyNotification,
             object: self
         )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(windowFocusGained),
+            name: NSWindow.didBecomeKeyNotification,
+            object: self
+        )
     }
 
     deinit {
@@ -1345,6 +1390,13 @@ final class StickerWindow: NSPanel {
 
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
+
+    override func sendEvent(_ event: NSEvent) {
+        if event.type == .leftMouseDown || event.type == .rightMouseDown {
+            onActivate?()
+        }
+        super.sendEvent(event)
+    }
 
     fileprivate func containsStableMouseLocation(_ location: NSPoint) -> Bool {
         containsMouseLocation(location, in: presentationTargetFrame ?? frame)
@@ -1361,6 +1413,10 @@ final class StickerWindow: NSPanel {
     @objc private func windowFrameChanged() {
         guard !suppressesFrameChangeNotifications else { return }
         onChange?()
+    }
+
+    @objc private func windowFocusGained() {
+        onActivate?()
     }
 
     @objc private func windowFocusLost() {
