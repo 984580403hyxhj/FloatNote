@@ -733,11 +733,7 @@ final class BubbleWindow: NSWindow {
 
 private extension NSWindow {
     func containsMouseLocation(_ location: NSPoint) -> Bool {
-        containsMouseLocation(location, in: frame)
-    }
-
-    func containsMouseLocation(_ location: NSPoint, in targetFrame: NSRect) -> Bool {
-        targetFrame.contains(location)
+        frame.contains(location)
     }
 }
 
@@ -1399,7 +1395,7 @@ final class StickerWindow: NSPanel {
     }
 
     fileprivate func containsStableMouseLocation(_ location: NSPoint) -> Bool {
-        containsMouseLocation(location, in: presentationTargetFrame ?? frame)
+        (presentationTargetFrame ?? frame).contains(location)
     }
 
     func focusEditor() {
@@ -1751,7 +1747,7 @@ final class StickerView: NSView, NSTextViewDelegate {
         let cursorOffsetInLine = affectedCharRange.location - currentLineStart
         let linePrefix = nsString.substring(with: NSRange(location: currentLineStart, length: cursorOffsetInLine))
 
-        if let match = checklistMatch(in: linePrefix) {
+        if let match = MarkdownParagraphLayout.checklistMatch(in: linePrefix) {
             if match.body.trimmingCharacters(in: .whitespaces).isEmpty {
                 textView.insertText("", replacementRange: NSRange(location: currentLineStart, length: cursorOffsetInLine))
                 finishHandledTextChange(in: textView)
@@ -1763,7 +1759,7 @@ final class StickerView: NSView, NSTextViewDelegate {
             return false
         }
 
-        if let match = bulletListMatch(in: linePrefix) {
+        if let match = MarkdownParagraphLayout.bulletListMatch(in: linePrefix) {
             if match.body.trimmingCharacters(in: .whitespaces).isEmpty {
                 textView.insertText("", replacementRange: NSRange(location: currentLineStart, length: cursorOffsetInLine))
                 finishHandledTextChange(in: textView)
@@ -1775,8 +1771,8 @@ final class StickerView: NSView, NSTextViewDelegate {
             return false
         }
 
-        guard let match = numberedListMatch(in: linePrefix) else {
-            let indent = leadingIndent(in: linePrefix)
+        guard let match = MarkdownParagraphLayout.orderedListMatch(in: linePrefix) else {
+            let indent = MarkdownParagraphLayout.leadingWhitespace(in: linePrefix)
             let bodyStart = linePrefix.index(linePrefix.startIndex, offsetBy: indent.count)
             let body = linePrefix[bodyStart...].trimmingCharacters(in: .whitespaces)
 
@@ -1806,80 +1802,6 @@ final class StickerView: NSView, NSTextViewDelegate {
         (textView as? StickerTextView)?.renumberOrderedListsPreservingSelection()
         updateTextLayout()
         onTextChanged?()
-    }
-
-    private func leadingIndent(in linePrefix: String) -> String {
-        var indent = ""
-        for character in linePrefix {
-            if character == " " || character == "\t" {
-                indent.append(character)
-            } else {
-                break
-            }
-        }
-        return indent
-    }
-
-    private func numberedListMatch(in linePrefix: String) -> (indent: String, number: Int, separator: String, body: String)? {
-        let pattern = #"^(\s*)(\d+)([.)、])\s*(.*)$"#
-        guard let regex = try? NSRegularExpression(pattern: pattern) else {
-            return nil
-        }
-
-        let nsLine = linePrefix as NSString
-        let fullRange = NSRange(location: 0, length: nsLine.length)
-        guard let result = regex.firstMatch(in: linePrefix, range: fullRange),
-              result.numberOfRanges == 5,
-              let number = Int(nsLine.substring(with: result.range(at: 2))) else {
-            return nil
-        }
-
-        return (
-            indent: nsLine.substring(with: result.range(at: 1)),
-            number: number,
-            separator: nsLine.substring(with: result.range(at: 3)),
-            body: nsLine.substring(with: result.range(at: 4))
-        )
-    }
-
-    private func checklistMatch(in linePrefix: String) -> (indent: String, marker: String, body: String)? {
-        let pattern = #"^(\s*)([-*•])\s+\[[ xX]\]\s*(.*)$"#
-        guard let regex = try? NSRegularExpression(pattern: pattern) else {
-            return nil
-        }
-
-        let nsLine = linePrefix as NSString
-        let fullRange = NSRange(location: 0, length: nsLine.length)
-        guard let result = regex.firstMatch(in: linePrefix, range: fullRange),
-              result.numberOfRanges == 4 else {
-            return nil
-        }
-
-        return (
-            indent: nsLine.substring(with: result.range(at: 1)),
-            marker: nsLine.substring(with: result.range(at: 2)),
-            body: nsLine.substring(with: result.range(at: 3))
-        )
-    }
-
-    private func bulletListMatch(in linePrefix: String) -> (indent: String, marker: String, body: String)? {
-        let pattern = #"^(\s*)([-*•])\s+(.*)$"#
-        guard let regex = try? NSRegularExpression(pattern: pattern) else {
-            return nil
-        }
-
-        let nsLine = linePrefix as NSString
-        let fullRange = NSRange(location: 0, length: nsLine.length)
-        guard let result = regex.firstMatch(in: linePrefix, range: fullRange),
-              result.numberOfRanges == 4 else {
-            return nil
-        }
-
-        return (
-            indent: nsLine.substring(with: result.range(at: 1)),
-            marker: nsLine.substring(with: result.range(at: 2)),
-            body: nsLine.substring(with: result.range(at: 3))
-        )
     }
 
     func textDidChange(_ notification: Notification) {
@@ -2122,6 +2044,180 @@ private enum MarkdownPipeTableParser {
     }
 }
 
+private enum MarkdownParagraphLayout {
+    struct OrderedListMatch {
+        let indent: String
+        let numberText: String
+        let number: Int
+        let separator: String
+        let spacing: String
+        let body: String
+    }
+
+    struct ChecklistMatch {
+        let indent: String
+        let marker: String
+        let spacing: String
+        let body: String
+    }
+
+    struct BulletListMatch {
+        let indent: String
+        let marker: String
+        let spacing: String
+        let body: String
+    }
+
+    private static let orderedListLineRegex = try? NSRegularExpression(pattern: #"^([ \t]*)(\d+)([.)、])([ \t]*)(.*)$"#)
+    private static let checklistLineRegex = try? NSRegularExpression(pattern: #"^([ \t]*)([-*•])([ \t]+\[[ xX]\][ \t]*)(.*)$"#)
+    private static let bulletLineRegex = try? NSRegularExpression(pattern: #"^([ \t]*)([-*•])([ \t]+)(.*)$"#)
+
+    static func defaultParagraphStyle(font: NSFont, lineSpacing: CGFloat = 0) -> NSParagraphStyle {
+        let style = NSMutableParagraphStyle()
+        style.lineBreakMode = .byWordWrapping
+        style.lineSpacing = lineSpacing
+        style.defaultTabInterval = max(24, measuredWidth(of: "    ", font: font))
+        style.tabStops = []
+        return style
+    }
+
+    static func paragraphStyle(for line: String, font: NSFont, lineSpacing: CGFloat = 0, maxContinuationIndent: CGFloat) -> NSParagraphStyle {
+        let style = defaultParagraphStyle(font: font, lineSpacing: lineSpacing).mutableCopy() as? NSMutableParagraphStyle ?? NSMutableParagraphStyle()
+        style.firstLineHeadIndent = 0
+        style.headIndent = min(measuredWidth(of: continuationPrefix(for: line), font: font), maxContinuationIndent)
+        return style
+    }
+
+    static func contentLine(in text: NSString, paragraphRange: NSRange) -> String {
+        var contentLength = paragraphRange.length
+        while contentLength > 0 {
+            let tail = text.substring(with: NSRange(location: paragraphRange.location + contentLength - 1, length: 1))
+            if tail == "\n" || tail == "\r" {
+                contentLength -= 1
+            } else {
+                break
+            }
+        }
+
+        return text.substring(with: NSRange(location: paragraphRange.location, length: contentLength))
+    }
+
+    static func leadingWhitespace(in line: String) -> String {
+        var indent = ""
+        for character in line {
+            if character == " " || character == "\t" {
+                indent.append(character)
+            } else {
+                break
+            }
+        }
+        return indent
+    }
+
+    static func measuredWidth(of prefix: String, font: NSFont) -> CGFloat {
+        guard !prefix.isEmpty else {
+            return 0
+        }
+
+        let attributes: [NSAttributedString.Key: Any] = [.font: font]
+        var width: CGFloat = 0
+        for character in prefix {
+            let printable = character == "\t" ? "    " : String(character)
+            width += (printable as NSString).size(withAttributes: attributes).width
+        }
+        return ceil(width)
+    }
+
+    static func indentationWidth(for indent: String) -> Int {
+        indent.reduce(0) { total, character in
+            total + (character == "\t" ? 4 : 1)
+        }
+    }
+
+    static func orderedListMatch(in line: String) -> OrderedListMatch? {
+        guard let regex = orderedListLineRegex else {
+            return nil
+        }
+
+        let nsLine = line as NSString
+        let fullRange = NSRange(location: 0, length: nsLine.length)
+        guard let match = regex.firstMatch(in: line, range: fullRange),
+              match.numberOfRanges == 6 else {
+            return nil
+        }
+
+        let numberText = nsLine.substring(with: match.range(at: 2))
+        guard let number = Int(numberText) else {
+            return nil
+        }
+
+        return OrderedListMatch(
+            indent: nsLine.substring(with: match.range(at: 1)),
+            numberText: numberText,
+            number: number,
+            separator: nsLine.substring(with: match.range(at: 3)),
+            spacing: nsLine.substring(with: match.range(at: 4)),
+            body: nsLine.substring(with: match.range(at: 5))
+        )
+    }
+
+    static func checklistMatch(in line: String) -> ChecklistMatch? {
+        guard let regex = checklistLineRegex else {
+            return nil
+        }
+
+        let nsLine = line as NSString
+        let fullRange = NSRange(location: 0, length: nsLine.length)
+        guard let match = regex.firstMatch(in: line, range: fullRange),
+              match.numberOfRanges == 5 else {
+            return nil
+        }
+
+        return ChecklistMatch(
+            indent: nsLine.substring(with: match.range(at: 1)),
+            marker: nsLine.substring(with: match.range(at: 2)),
+            spacing: nsLine.substring(with: match.range(at: 3)),
+            body: nsLine.substring(with: match.range(at: 4))
+        )
+    }
+
+    static func bulletListMatch(in line: String) -> BulletListMatch? {
+        guard let regex = bulletLineRegex else {
+            return nil
+        }
+
+        let nsLine = line as NSString
+        let fullRange = NSRange(location: 0, length: nsLine.length)
+        guard let match = regex.firstMatch(in: line, range: fullRange),
+              match.numberOfRanges == 5 else {
+            return nil
+        }
+
+        return BulletListMatch(
+            indent: nsLine.substring(with: match.range(at: 1)),
+            marker: nsLine.substring(with: match.range(at: 2)),
+            spacing: nsLine.substring(with: match.range(at: 3)),
+            body: nsLine.substring(with: match.range(at: 4))
+        )
+    }
+
+    private static func continuationPrefix(for line: String) -> String {
+        if let match = orderedListMatch(in: line) {
+            return "\(match.indent)\(match.numberText)\(match.separator)\(match.spacing)"
+        }
+
+        if let match = checklistMatch(in: line) {
+            return "\(match.indent)\(match.marker)\(match.spacing)"
+        }
+
+        if let match = bulletListMatch(in: line) {
+            return "\(match.indent)\(match.marker)\(match.spacing)"
+        }
+
+        return leadingWhitespace(in: line)
+    }
+}
+
 private enum MarkdownPreviewBlock {
     case text(MarkdownPreviewTextBlock)
     case table(MarkdownPreviewTable)
@@ -2173,10 +2269,6 @@ final class MarkdownPreviewView: NSView {
 
     private var layout: Layout?
     private var sourceMarkdown = ""
-
-    private static let orderedListLineRegex = try? NSRegularExpression(pattern: #"^([ \t]*)(\d+)([.)、])([ \t]*)(.*)$"#)
-    private static let checklistLineRegex = try? NSRegularExpression(pattern: #"^([ \t]*)([-*•])([ \t]+\[[ xX]\][ \t]*)(.*)$"#)
-    private static let bulletLineRegex = try? NSRegularExpression(pattern: #"^([ \t]*)([-*•])([ \t]+)(.*)$"#)
 
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
@@ -2459,7 +2551,7 @@ final class MarkdownPreviewView: NSView {
 
         while location < nsText.length {
             let paragraphRange = nsText.lineRange(for: NSRange(location: location, length: 0))
-            let line = contentLine(in: nsText, paragraphRange: paragraphRange)
+            let line = MarkdownParagraphLayout.contentLine(in: nsText, paragraphRange: paragraphRange)
             attributedText.addAttribute(
                 .paragraphStyle,
                 value: paragraphStyle(forBodyLine: line, font: font, wrapWidth: wrapWidth),
@@ -2470,92 +2562,7 @@ final class MarkdownPreviewView: NSView {
     }
 
     private func paragraphStyle(forBodyLine line: String, font: NSFont, wrapWidth: CGFloat) -> NSParagraphStyle {
-        let style = NSMutableParagraphStyle()
-        style.lineBreakMode = .byWordWrapping
-        style.lineSpacing = 4
-        style.defaultTabInterval = max(24, measuredWidth(of: "    ", font: font))
-        style.tabStops = []
-        style.firstLineHeadIndent = 0
-        style.headIndent = min(measuredWidth(of: continuationPrefix(for: line), font: font), max(0, wrapWidth - 48))
-        return style
-    }
-
-    private func continuationPrefix(for line: String) -> String {
-        let nsLine = line as NSString
-        let fullRange = NSRange(location: 0, length: nsLine.length)
-
-        if let regex = Self.orderedListLineRegex,
-           let match = regex.firstMatch(in: line, range: fullRange),
-           match.numberOfRanges == 6 {
-            return [
-                nsLine.substring(with: match.range(at: 1)),
-                nsLine.substring(with: match.range(at: 2)),
-                nsLine.substring(with: match.range(at: 3)),
-                nsLine.substring(with: match.range(at: 4))
-            ].joined()
-        }
-
-        if let regex = Self.checklistLineRegex,
-           let match = regex.firstMatch(in: line, range: fullRange),
-           match.numberOfRanges == 5 {
-            return [
-                nsLine.substring(with: match.range(at: 1)),
-                nsLine.substring(with: match.range(at: 2)),
-                nsLine.substring(with: match.range(at: 3))
-            ].joined()
-        }
-
-        if let regex = Self.bulletLineRegex,
-           let match = regex.firstMatch(in: line, range: fullRange),
-           match.numberOfRanges == 5 {
-            return [
-                nsLine.substring(with: match.range(at: 1)),
-                nsLine.substring(with: match.range(at: 2)),
-                nsLine.substring(with: match.range(at: 3))
-            ].joined()
-        }
-
-        return leadingWhitespace(in: line)
-    }
-
-    private func contentLine(in text: NSString, paragraphRange: NSRange) -> String {
-        var contentLength = paragraphRange.length
-        while contentLength > 0 {
-            let tail = text.substring(with: NSRange(location: paragraphRange.location + contentLength - 1, length: 1))
-            if tail == "\n" || tail == "\r" {
-                contentLength -= 1
-            } else {
-                break
-            }
-        }
-
-        return text.substring(with: NSRange(location: paragraphRange.location, length: contentLength))
-    }
-
-    private func leadingWhitespace(in line: String) -> String {
-        var indent = ""
-        for character in line {
-            if character == " " || character == "\t" {
-                indent.append(character)
-            } else {
-                break
-            }
-        }
-        return indent
-    }
-
-    private func measuredWidth(of prefix: String, font: NSFont) -> CGFloat {
-        guard !prefix.isEmpty else {
-            return 0
-        }
-
-        let attributes: [NSAttributedString.Key: Any] = [.font: font]
-        var width: CGFloat = 0
-        for character in prefix {
-            let printable = character == "\t" ? "    " : String(character)
-            width += (printable as NSString).size(withAttributes: attributes).width
-        }
-        return ceil(width)
+        MarkdownParagraphLayout.paragraphStyle(for: line, font: font, lineSpacing: 4, maxContinuationIndent: max(0, wrapWidth - 48))
     }
 
     private func attributedInlineText(_ text: String, font: NSFont, boldFont: NSFont, alignment: MarkdownTableAlignment, lineSpacing: CGFloat = 2) -> NSAttributedString {
@@ -2704,12 +2711,12 @@ final class StickerTextView: NSTextView {
         let separatorRowIndex: Int
     }
 
-    private static let orderedListLineRegex = try? NSRegularExpression(pattern: #"^([ \t]*)(\d+)([.)、])([ \t]*)(.*)$"#)
-    private static let checklistLineRegex = try? NSRegularExpression(pattern: #"^([ \t]*)([-*•])([ \t]+\[[ xX]\][ \t]*)(.*)$"#)
-    private static let bulletLineRegex = try? NSRegularExpression(pattern: #"^([ \t]*)([-*•])([ \t]+)(.*)$"#)
-
     private var isRefreshingParagraphLayout = false
     private var isRenumberingOrderedLists = false
+
+    private var displayFont: NSFont {
+        font ?? NSFont.systemFont(ofSize: baseStickerFontSize)
+    }
 
     private var tableFont: NSFont {
         NSFont.monospacedSystemFont(ofSize: max(minimumStickerFontSize, (font?.pointSize ?? baseStickerFontSize) - 2), weight: .regular)
@@ -2947,7 +2954,7 @@ final class StickerTextView: NSTextView {
         var location = 0
         while location < fullLength {
             let paragraphRange = nsText.lineRange(for: NSRange(location: location, length: 0))
-            let line = contentLine(in: nsText, paragraphRange: paragraphRange)
+            let line = MarkdownParagraphLayout.contentLine(in: nsText, paragraphRange: paragraphRange)
             let paragraphStyle = paragraphStyle(for: line)
             textStorage.addAttribute(.paragraphStyle, value: paragraphStyle, range: paragraphRange)
             location = paragraphRange.location + paragraphRange.length
@@ -2971,93 +2978,19 @@ final class StickerTextView: NSTextView {
 
         let location = min(selectedRange().location, nsText.length)
         let paragraphRange = nsText.lineRange(for: NSRange(location: location, length: 0))
-        return paragraphStyle(for: contentLine(in: nsText, paragraphRange: paragraphRange))
+        return paragraphStyle(for: MarkdownParagraphLayout.contentLine(in: nsText, paragraphRange: paragraphRange))
     }
 
     private func paragraphStyle(for line: String) -> NSParagraphStyle {
-        let style = defaultParagraphStyle().mutableCopy() as? NSMutableParagraphStyle ?? NSMutableParagraphStyle()
-        let prefix = continuationPrefix(for: line)
-        let continuationIndent = min(measuredWidth(of: prefix), maxContinuationIndent())
-        style.firstLineHeadIndent = 0
-        style.headIndent = continuationIndent
-        return style
+        MarkdownParagraphLayout.paragraphStyle(
+            for: line,
+            font: displayFont,
+            maxContinuationIndent: maxContinuationIndent()
+        )
     }
 
     private func defaultParagraphStyle() -> NSParagraphStyle {
-        let style = NSMutableParagraphStyle()
-        style.lineBreakMode = .byWordWrapping
-        style.defaultTabInterval = max(24, measuredWidth(of: "    "))
-        style.tabStops = []
-        return style
-    }
-
-    private func continuationPrefix(for line: String) -> String {
-        let nsLine = line as NSString
-        let fullRange = NSRange(location: 0, length: nsLine.length)
-
-        if let regex = Self.orderedListLineRegex,
-           let match = regex.firstMatch(in: line, range: fullRange),
-           match.numberOfRanges == 6 {
-            return [
-                nsLine.substring(with: match.range(at: 1)),
-                nsLine.substring(with: match.range(at: 2)),
-                nsLine.substring(with: match.range(at: 3)),
-                nsLine.substring(with: match.range(at: 4))
-            ].joined()
-        }
-
-        if let regex = Self.checklistLineRegex,
-           let match = regex.firstMatch(in: line, range: fullRange),
-           match.numberOfRanges == 5 {
-            return [
-                nsLine.substring(with: match.range(at: 1)),
-                nsLine.substring(with: match.range(at: 2)),
-                nsLine.substring(with: match.range(at: 3))
-            ].joined()
-        }
-
-        if let regex = Self.bulletLineRegex,
-           let match = regex.firstMatch(in: line, range: fullRange),
-           match.numberOfRanges == 5 {
-            return [
-                nsLine.substring(with: match.range(at: 1)),
-                nsLine.substring(with: match.range(at: 2)),
-                nsLine.substring(with: match.range(at: 3))
-            ].joined()
-        }
-
-        return leadingWhitespace(in: line)
-    }
-
-    private func contentLine(in text: NSString, paragraphRange: NSRange) -> String {
-        var contentLength = paragraphRange.length
-        while contentLength > 0 {
-            let tail = text.substring(with: NSRange(location: paragraphRange.location + contentLength - 1, length: 1))
-            if tail == "\n" || tail == "\r" {
-                contentLength -= 1
-            } else {
-                break
-            }
-        }
-
-        return text.substring(with: NSRange(location: paragraphRange.location, length: contentLength))
-    }
-
-    private func measuredWidth(of prefix: String) -> CGFloat {
-        guard !prefix.isEmpty else {
-            return 0
-        }
-
-        let font = self.font ?? NSFont.systemFont(ofSize: baseStickerFontSize)
-        let attributes: [NSAttributedString.Key: Any] = [.font: font]
-        var width: CGFloat = 0
-
-        for character in prefix {
-            let printable = character == "\t" ? "    " : String(character)
-            width += (printable as NSString).size(withAttributes: attributes).width
-        }
-
-        return ceil(width)
+        MarkdownParagraphLayout.defaultParagraphStyle(font: displayFont)
     }
 
     private func maxContinuationIndent() -> CGFloat {
@@ -3079,7 +3012,7 @@ final class StickerTextView: NSTextView {
         let maxTableWidth = tableBlocks
             .flatMap(\.rowRanges)
             .map { rowRange -> CGFloat in
-                let line = contentLine(in: nsText, paragraphRange: rowRange)
+                let line = MarkdownParagraphLayout.contentLine(in: nsText, paragraphRange: rowRange)
                 return measuredTableWidth(of: line)
             }
             .max() ?? visibleWidth
@@ -3151,7 +3084,7 @@ final class StickerTextView: NSTextView {
 
         while location < fullLength {
             let lineRange = text.lineRange(for: NSRange(location: location, length: 0))
-            records.append((range: lineRange, content: contentLine(in: text, paragraphRange: lineRange)))
+            records.append((range: lineRange, content: MarkdownParagraphLayout.contentLine(in: text, paragraphRange: lineRange)))
             location = lineRange.location + lineRange.length
         }
 
@@ -3248,24 +3181,16 @@ final class StickerTextView: NSTextView {
     }
 
     private func renumberedOrderedListText(from text: String) -> String {
-        guard let regex = Self.orderedListLineRegex else {
-            return text
-        }
-
         var countersByIndentWidth: [Int: Int] = [:]
         var didChange = false
         let lines = text.components(separatedBy: "\n")
         let rewrittenLines = lines.map { line -> String in
-            let nsLine = line as NSString
-            let fullRange = NSRange(location: 0, length: nsLine.length)
-
-            guard let match = regex.firstMatch(in: line, range: fullRange),
-                  match.numberOfRanges == 6 else {
+            guard let match = MarkdownParagraphLayout.orderedListMatch(in: line) else {
                 let trimmed = line.trimmingCharacters(in: .whitespaces)
                 if trimmed.isEmpty {
                     countersByIndentWidth.removeAll()
                 } else {
-                    let lineIndentWidth = indentationWidth(for: leadingWhitespace(in: line))
+                    let lineIndentWidth = MarkdownParagraphLayout.indentationWidth(for: MarkdownParagraphLayout.leadingWhitespace(in: line))
                     for key in Array(countersByIndentWidth.keys) where key >= lineIndentWidth {
                         countersByIndentWidth.removeValue(forKey: key)
                     }
@@ -3273,12 +3198,7 @@ final class StickerTextView: NSTextView {
                 return line
             }
 
-            let indent = nsLine.substring(with: match.range(at: 1))
-            let originalNumber = nsLine.substring(with: match.range(at: 2))
-            let separator = nsLine.substring(with: match.range(at: 3))
-            let spacing = nsLine.substring(with: match.range(at: 4))
-            let body = nsLine.substring(with: match.range(at: 5))
-            let indentWidth = indentationWidth(for: indent)
+            let indentWidth = MarkdownParagraphLayout.indentationWidth(for: match.indent)
 
             for key in Array(countersByIndentWidth.keys) where key > indentWidth {
                 countersByIndentWidth.removeValue(forKey: key)
@@ -3287,32 +3207,14 @@ final class StickerTextView: NSTextView {
             let nextNumber = (countersByIndentWidth[indentWidth] ?? 0) + 1
             countersByIndentWidth[indentWidth] = nextNumber
 
-            if originalNumber != "\(nextNumber)" {
+            if match.numberText != "\(nextNumber)" {
                 didChange = true
             }
 
-            return "\(indent)\(nextNumber)\(separator)\(spacing)\(body)"
+            return "\(match.indent)\(nextNumber)\(match.separator)\(match.spacing)\(match.body)"
         }
 
         return didChange ? rewrittenLines.joined(separator: "\n") : text
-    }
-
-    private func leadingWhitespace(in line: String) -> String {
-        var indent = ""
-        for character in line {
-            if character == " " || character == "\t" {
-                indent.append(character)
-            } else {
-                break
-            }
-        }
-        return indent
-    }
-
-    private func indentationWidth(for indent: String) -> Int {
-        indent.reduce(0) { total, character in
-            total + (character == "\t" ? 4 : 1)
-        }
     }
 
     private func caretAnchor(in text: String, location: Int) -> CaretAnchor {
