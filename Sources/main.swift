@@ -6,15 +6,15 @@ private let stickerSize: CGFloat = 320
 private let resizeHandleSize: CGFloat = 18
 private let resizeEdgeThickness: CGFloat = 10
 private let minimumStickerSize = NSSize(width: 220, height: 180)
-private let previewHideDelay: TimeInterval = 0.5
+private let previewHideDelay: TimeInterval = 0.06
 private let previewPollInterval: TimeInterval = 0.03
 private let restoreHotspotWidth: CGFloat = 16
 private let hideMenuSize = NSSize(width: 52, height: 52)
 private let hideMenuGap: CGFloat = 8
 private let hideMenuHideDelay: TimeInterval = 0.35
-private let stickerAnimationOffset: CGFloat = 180
-private let stickerAnimationFirstDuration: TimeInterval = 0.12
-private let stickerAnimationSecondDuration: TimeInterval = 0.30
+private let stickerAnimationOffset: CGFloat = 160
+private let stickerSlideInDuration: TimeInterval = 0.18
+private let stickerSlideOutDuration: TimeInterval = 0.14
 private let baseStickerFontSize: CGFloat = 17
 private let minimumStickerFontSize: CGFloat = 8
 private let maximumStickerFontSize: CGFloat = 28
@@ -248,7 +248,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         stopPreviewHoverPolling()
         stopPreviewClickMonitors()
         bubbleWindow?.hideHoverMenuImmediately()
-        stickerWindows.forEach { hideStickerWindow($0) }
+        stickerWindows.forEach { hideStickerWindow($0, animated: true) }
         bubbleWindow?.orderOut(nil)
         showRestoreHotspots()
     }
@@ -347,7 +347,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         stopPreviewHoverPolling()
         stopPreviewClickMonitors()
         bubbleWindow?.hideHoverMenuImmediately()
-        stickerWindows.forEach { hideStickerWindow($0) }
+        stickerWindows.forEach { hideStickerWindow($0, animated: true) }
         bubbleWindow?.orderOut(nil)
         showRestoreHotspots()
     }
@@ -441,25 +441,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         presentationGeneration &+= 1
     }
 
-    private func hideStickerWindow(_ window: StickerWindow, targetFrame explicitTargetFrame: NSRect? = nil) {
+    private func hideStickerWindow(_ window: StickerWindow, targetFrame explicitTargetFrame: NSRect? = nil, animated: Bool = false) {
         let targetFrame = explicitTargetFrame ?? window.presentationTargetFrame ?? window.frame
-        window.presentationTargetFrame = nil
+        guard animated, window.isVisible else {
+            window.presentationTargetFrame = nil
+            window.suppressesFrameChangeNotifications = false
+            window.alphaValue = 0
+            window.setFrame(targetFrame, display: false)
+            window.orderOut(nil)
+            return
+        }
+
+        let animationGeneration = presentationGeneration
+        let hiddenFrame = hiddenStickerFrame(for: targetFrame)
+        window.presentationTargetFrame = targetFrame
+        window.suppressesFrameChangeNotifications = true
+
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = stickerSlideOutDuration
+            context.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            window.animator().alphaValue = 0
+            window.animator().setFrame(hiddenFrame, display: true)
+        } completionHandler: { [weak self, weak window] in
+            guard let self, let window else { return }
+            guard self.presentationGeneration == animationGeneration, self.visibilityState == .hidden else {
+                return
+            }
+
+            window.presentationTargetFrame = nil
+            window.suppressesFrameChangeNotifications = false
+            window.alphaValue = 0
+            window.setFrame(targetFrame, display: false)
+            window.orderOut(nil)
+        }
+    }
+
+    private func hiddenStickerFrame(for targetFrame: NSRect) -> NSRect {
+        targetFrame.offsetBy(dx: stickerAnimationOffset, dy: 0)
+    }
+
+    private func restoreStickerWindow(_ window: StickerWindow, targetFrame: NSRect, focusEditor: Bool) {
         window.suppressesFrameChangeNotifications = false
-        window.alphaValue = 0
         window.setFrame(targetFrame, display: false)
-        window.orderOut(nil)
+        window.alphaValue = 1
+        window.presentationTargetFrame = nil
+        if focusEditor {
+            window.focusEditor()
+        }
     }
 
     private func finishCancelledStickerPresentation(_ window: StickerWindow, targetFrame: NSRect) {
         switch visibilityState {
         case .hidden:
-            hideStickerWindow(window, targetFrame: targetFrame)
+            hideStickerWindow(window, targetFrame: targetFrame, animated: true)
         case .pinned:
-            window.presentationTargetFrame = nil
-            window.suppressesFrameChangeNotifications = false
-            window.alphaValue = 1
-            window.setFrame(targetFrame, display: true)
             window.orderFrontRegardless()
+            restoreStickerWindow(window, targetFrame: targetFrame, focusEditor: false)
         case .peek:
             break
         }
@@ -479,62 +516,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let targetFrame = window.presentationTargetFrame ?? window.frame
 
         guard animated else {
-            window.presentationTargetFrame = nil
-            window.suppressesFrameChangeNotifications = false
-            window.alphaValue = 1
             window.setFrame(targetFrame, display: true)
             window.orderFrontRegardless()
-            if focusEditor {
-                window.focusEditor()
-            }
+            restoreStickerWindow(window, targetFrame: targetFrame, focusEditor: focusEditor)
             return
         }
 
-        let firstFrame = targetFrame.offsetBy(dx: stickerAnimationOffset, dy: 0)
-        let settleFrame = targetFrame.offsetBy(dx: 24, dy: 0)
+        let startFrame = hiddenStickerFrame(for: targetFrame)
         let animationGeneration = presentationGeneration
 
         window.presentationTargetFrame = targetFrame
         window.suppressesFrameChangeNotifications = true
         window.alphaValue = 0
-        window.setFrame(firstFrame, display: true)
+        window.setFrame(startFrame, display: true)
         window.orderFrontRegardless()
 
         NSAnimationContext.runAnimationGroup { context in
-            context.duration = stickerAnimationFirstDuration
+            context.duration = stickerSlideInDuration
             context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            window.animator().alphaValue = 0.96
-            window.animator().setFrame(settleFrame, display: true)
+            window.animator().alphaValue = 1
+            window.animator().setFrame(targetFrame, display: true)
         } completionHandler: { [weak self, weak window] in
             guard let self, let window else { return }
             guard self.presentationGeneration == animationGeneration else {
                 self.finishCancelledStickerPresentation(window, targetFrame: targetFrame)
                 return
             }
-
-            NSAnimationContext.runAnimationGroup { context in
-                context.duration = stickerAnimationSecondDuration
-                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-                window.animator().alphaValue = 1
-                window.animator().setFrame(targetFrame, display: true)
-            } completionHandler: { [weak self, weak window] in
-                guard let self, let window else { return }
-                guard self.presentationGeneration == animationGeneration else {
-                    self.finishCancelledStickerPresentation(window, targetFrame: targetFrame)
-                    return
-                }
-                window.setFrame(targetFrame, display: true)
-                window.alphaValue = 1
-                window.presentationTargetFrame = nil
-                window.suppressesFrameChangeNotifications = false
-                window.notifyPresentationFinished()
-
-                if focusEditor {
-                    window.focusEditor()
-                }
-
-                self.scheduleSave()
-            }
+            self.restoreStickerWindow(window, targetFrame: targetFrame, focusEditor: focusEditor)
+            window.notifyPresentationFinished()
+            self.scheduleSave()
         }
     }
 
