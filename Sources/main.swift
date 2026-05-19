@@ -2015,29 +2015,31 @@ private enum MarkdownPipeTableParser {
         }
 
         var dashScore = 0
+        var hasWideDash = false
         for character in marker {
             if character.isWhitespace || isAlignmentColon(character) {
                 continue
             }
-            guard let score = separatorDashScore(for: character) else {
+            guard let dash = separatorDash(for: character) else {
                 return false
             }
-            dashScore += score
+            dashScore += dash.score
+            hasWideDash = hasWideDash || dash.isWide
         }
 
-        return dashScore >= 3
+        return dashScore >= 3 || (hasWideDash && dashScore >= 2)
     }
 
     private static func isAlignmentColon(_ character: Character) -> Bool {
         character == ":" || character == "："
     }
 
-    private static func separatorDashScore(for character: Character) -> Int? {
+    private static func separatorDash(for character: Character) -> (score: Int, isWide: Bool)? {
         switch character {
         case "-":
-            return 1
+            return (1, false)
         case "‐", "‑", "‒", "–", "—", "―", "−", "﹘", "﹣", "－", "─", "━":
-            return 2
+            return (2, true)
         default:
             return nil
         }
