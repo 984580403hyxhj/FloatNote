@@ -15,6 +15,8 @@ private let hideMenuHideDelay: TimeInterval = 0.35
 private let stickerAnimationOffset: CGFloat = 160
 private let stickerSlideInDuration: TimeInterval = 0.18
 private let stickerSlideOutDuration: TimeInterval = 0.14
+private let stickerWindowLevel = NSWindow.Level.statusBar
+private let floatingUIWindowLevel = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 1)
 private let baseStickerFontSize: CGFloat = 17
 private let minimumStickerFontSize: CGFloat = 8
 private let maximumStickerFontSize: CGFloat = 28
@@ -236,7 +238,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if window.isVisible {
             window.orderFrontRegardless()
         }
+        bringFloatingUIToFront()
         scheduleSave()
+    }
+
+    private func bringFloatingUIToFront() {
+        bubbleWindow?.orderVisibleControlsFront()
     }
 
     private func hideAll() {
@@ -519,6 +526,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             window.setFrame(targetFrame, display: true)
             window.orderFrontRegardless()
             restoreStickerWindow(window, targetFrame: targetFrame, focusEditor: focusEditor)
+            bringFloatingUIToFront()
             return
         }
 
@@ -530,6 +538,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.alphaValue = 0
         window.setFrame(startFrame, display: true)
         window.orderFrontRegardless()
+        bringFloatingUIToFront()
 
         NSAnimationContext.runAnimationGroup { context in
             context.duration = stickerSlideInDuration
@@ -591,7 +600,7 @@ final class BubbleWindow: NSWindow {
         backgroundColor = .clear
         hasShadow = true
         sharingType = .readOnly
-        level = .statusBar
+        level = floatingUIWindowLevel
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         isReleasedWhenClosed = false
 
@@ -606,6 +615,15 @@ final class BubbleWindow: NSWindow {
     }
 
     override var canBecomeKey: Bool { true }
+
+    func orderVisibleControlsFront() {
+        if isVisible {
+            orderFrontRegardless()
+        }
+        if hoverMenuWindow?.isVisible == true {
+            hoverMenuWindow?.orderFrontRegardless()
+        }
+    }
 
     func hideHoverMenuImmediately() {
         hideMenuWorkItem?.cancel()
@@ -962,7 +980,7 @@ final class HideMenuWindow: NSWindow {
         backgroundColor = .clear
         hasShadow = true
         sharingType = .readOnly
-        level = .statusBar
+        level = floatingUIWindowLevel
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         isReleasedWhenClosed = false
         contentView = hideMenuView
@@ -1352,7 +1370,7 @@ final class StickerWindow: NSPanel {
         backgroundColor = .clear
         hasShadow = true
         sharingType = .readOnly
-        level = .statusBar
+        level = stickerWindowLevel
         hidesOnDeactivate = false
         isReleasedWhenClosed = false
         minSize = minimumStickerSize
