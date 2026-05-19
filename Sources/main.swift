@@ -87,6 +87,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var previewLastInsideAt: Date?
     private var visibilityState: VisibilityState = .pinned
     private var restoreHotspotRequiresReentry = false
+    private var presentationGeneration = 0
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -203,18 +204,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func hideAll() {
         saveStickerState()
+        advancePresentationGeneration()
         visibilityState = .hidden
         restoreHotspotRequiresReentry = isInRestoreHotspot(NSEvent.mouseLocation)
         previewLastInsideAt = nil
         stopPreviewHoverPolling()
         stopPreviewClickMonitors()
         bubbleWindow?.hideHoverMenuImmediately()
-        stickerWindows.forEach { $0.orderOut(nil) }
+        stickerWindows.forEach { hideStickerWindow($0) }
         bubbleWindow?.orderOut(nil)
         showRestoreHotspots()
     }
 
     private func restoreAll() {
+        advancePresentationGeneration()
         visibilityState = .pinned
         restoreHotspotRequiresReentry = false
         previewLastInsideAt = nil
@@ -284,27 +287,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func showPreviewFromHidden() {
         guard visibilityState == .hidden else { return }
 
+        advancePresentationGeneration()
         visibilityState = .peek
         restoreHotspotRequiresReentry = false
         hideRestoreHotspots()
+        startPreviewClickMonitors()
+        startPreviewHoverPolling()
         stickerWindows.forEach { presentStickerWindow($0, animated: true, focusEditor: false) }
         bubbleWindow?.orderFrontRegardless()
         bubbleWindow?.showPersistentHideMenu()
-        startPreviewClickMonitors()
-        startPreviewHoverPolling()
         previewLastInsideAt = Date()
     }
 
     private func hidePreviewFromHidden() {
         guard visibilityState == .peek || visibilityState == .hidden else { return }
 
+        advancePresentationGeneration()
         visibilityState = .hidden
         restoreHotspotRequiresReentry = isInRestoreHotspot(NSEvent.mouseLocation)
         previewLastInsideAt = nil
         stopPreviewHoverPolling()
         stopPreviewClickMonitors()
         bubbleWindow?.hideHoverMenuImmediately()
-        stickerWindows.forEach { $0.orderOut(nil) }
+        stickerWindows.forEach { hideStickerWindow($0) }
         bubbleWindow?.orderOut(nil)
         showRestoreHotspots()
     }
@@ -313,13 +318,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard previewLocalClickMonitor == nil, previewGlobalClickMonitor == nil else { return }
 
         previewLocalClickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
-            self?.handlePreviewClick(at: NSEvent.mouseLocation)
+            let clickLocation = NSEvent.mouseLocation
+            self?.handlePreviewClick(at: clickLocation)
             return event
         }
 
         previewGlobalClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
+            let clickLocation = NSEvent.mouseLocation
             DispatchQueue.main.async {
-                self?.handlePreviewClick(at: NSEvent.mouseLocation)
+                self?.handlePreviewClick(at: clickLocation)
             }
         }
     }
@@ -375,13 +382,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func advancePresentationGeneration() {
+        presentationGeneration &+= 1
+    }
+
+    private func hideStickerWindow(_ window: StickerWindow, targetFrame explicitTargetFrame: NSRect? = nil) {
+        let targetFrame = explicitTargetFrame ?? window.presentationTargetFrame ?? window.frame
+        window.presentationTargetFrame = nil
+        window.suppressesFrameChangeNotifications = false
+        window.alphaValue = 0
+        window.setFrame(targetFrame, display: false)
+        window.orderOut(nil)
+    }
+
+    private func finishCancelledStickerPresentation(_ window: StickerWindow, targetFrame: NSRect) {
+        switch visibilityState {
+        case .hidden:
+            hideStickerWindow(window, targetFrame: targetFrame)
+        case .pinned:
+            window.presentationTargetFrame = nil
+            window.suppressesFrameChangeNotifications = false
+            window.alphaValue = 1
+            window.setFrame(targetFrame, display: true)
+            window.orderFrontRegardless()
+        case .peek:
+            break
+        }
+    }
+
     private func isFloatingUILocation(_ location: NSPoint) -> Bool {
         if bubbleWindow?.containsFloatingUILocation(location) == true {
             return true
         }
 
         return stickerWindows.contains { window in
-            window.isVisible && window.containsMouseLocation(location)
+            window.isVisible && window.containsStableMouseLocation(location)
         }
     }
 
@@ -402,6 +437,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let firstFrame = targetFrame.offsetBy(dx: stickerAnimationOffset, dy: 0)
         let settleFrame = targetFrame.offsetBy(dx: 24, dy: 0)
+        let animationGeneration = presentationGeneration
 
         window.presentationTargetFrame = targetFrame
         window.suppressesFrameChangeNotifications = true
@@ -415,7 +451,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             window.animator().alphaValue = 0.96
             window.animator().setFrame(settleFrame, display: true)
         } completionHandler: { [weak self, weak window] in
-            guard let window else { return }
+            guard let self, let window else { return }
+            guard self.presentationGeneration == animationGeneration else {
+                self.finishCancelledStickerPresentation(window, targetFrame: targetFrame)
+                return
+            }
 
             NSAnimationContext.runAnimationGroup { context in
                 context.duration = stickerAnimationSecondDuration
@@ -423,7 +463,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 window.animator().alphaValue = 1
                 window.animator().setFrame(targetFrame, display: true)
             } completionHandler: { [weak self, weak window] in
-                guard let window else { return }
+                guard let self, let window else { return }
+                guard self.presentationGeneration == animationGeneration else {
+                    self.finishCancelledStickerPresentation(window, targetFrame: targetFrame)
+                    return
+                }
                 window.setFrame(targetFrame, display: true)
                 window.alphaValue = 1
                 window.presentationTargetFrame = nil
@@ -434,7 +478,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     window.focusEditor()
                 }
 
-                self?.scheduleSave()
+                self.scheduleSave()
             }
         }
     }
@@ -632,7 +676,11 @@ final class BubbleWindow: NSWindow {
 
 private extension NSWindow {
     func containsMouseLocation(_ location: NSPoint) -> Bool {
-        if frame.contains(location) {
+        containsMouseLocation(location, in: frame)
+    }
+
+    func containsMouseLocation(_ location: NSPoint, in targetFrame: NSRect) -> Bool {
+        if targetFrame.contains(location) {
             return true
         }
 
@@ -644,7 +692,7 @@ private extension NSWindow {
             x: location.x,
             y: screen.frame.maxY - (location.y - screen.frame.minY)
         )
-        return frame.contains(flippedLocation)
+        return targetFrame.contains(flippedLocation)
     }
 }
 
@@ -1289,6 +1337,10 @@ final class StickerWindow: NSPanel {
 
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
+
+    fileprivate func containsStableMouseLocation(_ location: NSPoint) -> Bool {
+        containsMouseLocation(location, in: presentationTargetFrame ?? frame)
+    }
 
     func focusEditor() {
         stickerView?.focusEditor()
