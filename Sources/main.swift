@@ -8,6 +8,7 @@ private let resizeEdgeThickness: CGFloat = 10
 private let minimumStickerSize = NSSize(width: 220, height: 180)
 private let previewHideDelay: TimeInterval = 0.06
 private let previewPollInterval: TimeInterval = 0.03
+private let previewIntentPadding: CGFloat = 44
 private let restoreHotspotWidth: CGFloat = 16
 private let hideMenuSize = NSSize(width: 52, height: 52)
 private let hideMenuGap: CGFloat = 8
@@ -89,6 +90,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var previewGlobalClickMonitor: Any?
     private var previewHoverPollTimer: Timer?
     private var previewLastInsideAt: Date?
+    private var previewEntryLocation: NSPoint?
     private var previewPressedMouseButtons = 0
     private var visibilityState: VisibilityState = .pinned
     private var restoreHotspotRequiresReentry = false
@@ -252,6 +254,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         visibilityState = .hidden
         restoreHotspotRequiresReentry = isInRestoreHotspot(NSEvent.mouseLocation)
         previewLastInsideAt = nil
+        previewEntryLocation = nil
         stopPreviewHoverPolling()
         stopPreviewClickMonitors()
         bubbleWindow?.hideHoverMenuImmediately()
@@ -265,6 +268,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         visibilityState = .pinned
         restoreHotspotRequiresReentry = false
         previewLastInsideAt = nil
+        previewEntryLocation = nil
         stopPreviewHoverPolling()
         stopPreviewClickMonitors()
         hideRestoreHotspots()
@@ -334,6 +338,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         advancePresentationGeneration()
         visibilityState = .peek
         restoreHotspotRequiresReentry = false
+        previewEntryLocation = NSEvent.mouseLocation
         hideRestoreHotspots()
         startPreviewClickMonitors()
         startPreviewHoverPolling()
@@ -351,6 +356,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         visibilityState = .hidden
         restoreHotspotRequiresReentry = isInRestoreHotspot(NSEvent.mouseLocation)
         previewLastInsideAt = nil
+        previewEntryLocation = nil
         stopPreviewHoverPolling()
         stopPreviewClickMonitors()
         bubbleWindow?.hideHoverMenuImmediately()
@@ -411,7 +417,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        if isInRestoreHotspot(location) || isFloatingUILocation(location) {
+        if isInRestoreHotspot(location) || isFloatingUILocation(location) || isInPreviewIntentPath(location) {
             previewLastInsideAt = Date()
         } else {
             let leftAt = previewLastInsideAt ?? Date()
@@ -420,6 +426,67 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 hidePreviewFromHidden()
             }
         }
+    }
+
+    private func isInPreviewIntentPath(_ location: NSPoint) -> Bool {
+        guard let entryLocation = previewEntryLocation else {
+            return false
+        }
+
+        let entryFrame = NSRect(
+            x: entryLocation.x - previewIntentPadding,
+            y: entryLocation.y - previewIntentPadding,
+            width: previewIntentPadding * 2 + restoreHotspotWidth,
+            height: previewIntentPadding * 2
+        )
+        if entryFrame.contains(location) {
+            return true
+        }
+
+        return previewIntentTargetFrames().contains { targetFrame in
+            isLocation(location, inIntentPathFrom: entryLocation, to: targetFrame)
+        }
+    }
+
+    private func previewIntentTargetFrames() -> [NSRect] {
+        var frames = stickerWindows.compactMap { window -> NSRect? in
+            guard window.isVisible else { return nil }
+            return window.stablePresentationFrame
+        }
+
+        if let bubbleWindow, bubbleWindow.isVisible {
+            frames.append(bubbleWindow.frame)
+            if let hoverMenuFrame = bubbleWindow.visibleHoverMenuFrame {
+                frames.append(hoverMenuFrame)
+            }
+        }
+
+        return frames
+    }
+
+    private func isLocation(_ location: NSPoint, inIntentPathFrom entryLocation: NSPoint, to targetFrame: NSRect) -> Bool {
+        let paddedTarget = targetFrame.insetBy(dx: -previewIntentPadding, dy: -previewIntentPadding)
+        if paddedTarget.contains(location) {
+            return true
+        }
+
+        let targetEdgeX = min(paddedTarget.maxX, entryLocation.x)
+        let upperTargetPoint = NSPoint(x: targetEdgeX, y: paddedTarget.maxY)
+        let lowerTargetPoint = NSPoint(x: targetEdgeX, y: paddedTarget.minY)
+        return isLocation(location, inTriangle: entryLocation, upperTargetPoint, lowerTargetPoint)
+    }
+
+    private func isLocation(_ location: NSPoint, inTriangle a: NSPoint, _ b: NSPoint, _ c: NSPoint) -> Bool {
+        let denominator = ((b.y - c.y) * (a.x - c.x)) + ((c.x - b.x) * (a.y - c.y))
+        guard abs(denominator) > 0.001 else {
+            return false
+        }
+
+        let first = ((b.y - c.y) * (location.x - c.x) + (c.x - b.x) * (location.y - c.y)) / denominator
+        let second = ((c.y - a.y) * (location.x - c.x) + (a.x - c.x) * (location.y - c.y)) / denominator
+        let third = 1 - first - second
+        let tolerance: CGFloat = 0.02
+        return first >= -tolerance && second >= -tolerance && third >= -tolerance
     }
 
     private func handlePreviewMousePressIfNeeded(at location: NSPoint) -> Bool {
@@ -615,6 +682,13 @@ final class BubbleWindow: NSWindow {
     }
 
     override var canBecomeKey: Bool { true }
+
+    var visibleHoverMenuFrame: NSRect? {
+        guard hoverMenuWindow?.isVisible == true else {
+            return nil
+        }
+        return hoverMenuWindow?.frame
+    }
 
     func orderVisibleControlsFront() {
         if isVisible {
@@ -1342,8 +1416,12 @@ final class StickerWindow: NSPanel {
     fileprivate var presentationTargetFrame: NSRect?
     private weak var stickerView: StickerView?
 
+    fileprivate var stablePresentationFrame: NSRect {
+        presentationTargetFrame ?? frame
+    }
+
     fileprivate func storedRecord(zIndex: Int) -> StoredSticker {
-        let recordFrame = presentationTargetFrame ?? frame
+        let recordFrame = stablePresentationFrame
 
         return StoredSticker(
             id: id,
