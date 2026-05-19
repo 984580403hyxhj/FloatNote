@@ -7,6 +7,7 @@ private let resizeHandleSize: CGFloat = 18
 private let resizeEdgeThickness: CGFloat = 10
 private let minimumStickerSize = NSSize(width: 220, height: 180)
 private let previewHideDelay: TimeInterval = 0.5
+private let previewPollInterval: TimeInterval = 0.03
 private let restoreHotspotWidth: CGFloat = 16
 private let hideMenuSize = NSSize(width: 52, height: 52)
 private let hideMenuGap: CGFloat = 8
@@ -85,6 +86,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var previewGlobalClickMonitor: Any?
     private var previewHoverPollTimer: Timer?
     private var previewLastInsideAt: Date?
+    private var previewPressedMouseButtons = 0
     private var visibilityState: VisibilityState = .pinned
     private var restoreHotspotRequiresReentry = false
     private var presentationGeneration = 0
@@ -297,6 +299,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         bubbleWindow?.orderFrontRegardless()
         bubbleWindow?.showPersistentHideMenu()
         previewLastInsideAt = Date()
+        previewPressedMouseButtons = NSEvent.pressedMouseButtons
     }
 
     private func hidePreviewFromHidden() {
@@ -345,7 +348,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func startPreviewHoverPolling() {
         previewHoverPollTimer?.invalidate()
-        let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
+        previewPressedMouseButtons = NSEvent.pressedMouseButtons
+        let timer = Timer(timeInterval: previewPollInterval, repeats: true) { [weak self] _ in
             self?.checkPreviewHover()
         }
         RunLoop.main.add(timer, forMode: .common)
@@ -361,6 +365,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard visibilityState == .peek else { return }
 
         let location = NSEvent.mouseLocation
+        if handlePreviewMousePressIfNeeded(at: location) {
+            return
+        }
+
         if isInRestoreHotspot(location) || isFloatingUILocation(location) {
             previewLastInsideAt = Date()
         } else {
@@ -370,6 +378,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 hidePreviewFromHidden()
             }
         }
+    }
+
+    private func handlePreviewMousePressIfNeeded(at location: NSPoint) -> Bool {
+        let pressedButtons = NSEvent.pressedMouseButtons
+        defer { previewPressedMouseButtons = pressedButtons }
+
+        guard previewPressedMouseButtons == 0, pressedButtons != 0 else {
+            return false
+        }
+
+        handlePreviewClick(at: location)
+        return true
     }
 
     private func handlePreviewClick(at location: NSPoint) {
@@ -680,19 +700,7 @@ private extension NSWindow {
     }
 
     func containsMouseLocation(_ location: NSPoint, in targetFrame: NSRect) -> Bool {
-        if targetFrame.contains(location) {
-            return true
-        }
-
-        guard let screen = NSScreen.screens.first(where: { $0.frame.contains(location) }) else {
-            return false
-        }
-
-        let flippedLocation = NSPoint(
-            x: location.x,
-            y: screen.frame.maxY - (location.y - screen.frame.minY)
-        )
-        return targetFrame.contains(flippedLocation)
+        targetFrame.contains(location)
     }
 }
 
