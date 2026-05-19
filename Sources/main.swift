@@ -9,6 +9,9 @@ private let minimumStickerSize = NSSize(width: 220, height: 180)
 private let previewHideDelay: TimeInterval = 0.06
 private let previewPollInterval: TimeInterval = 0.03
 private let previewIntentPadding: CGFloat = 44
+private let previewIntentStallDelay: TimeInterval = 0.32
+private let previewIntentMovementThreshold: CGFloat = 1.5
+private let previewIntentProgressThreshold: CGFloat = 0.01
 private let restoreHotspotWidth: CGFloat = 16
 private let hideMenuSize = NSSize(width: 52, height: 52)
 private let hideMenuGap: CGFloat = 8
@@ -91,6 +94,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var previewHoverPollTimer: Timer?
     private var previewLastInsideAt: Date?
     private var previewEntryLocation: NSPoint?
+    private var previewIntentLastLocation: NSPoint?
+    private var previewIntentLastProgressAt: Date?
+    private var previewIntentBestProgress: CGFloat = 0
     private var previewPressedMouseButtons = 0
     private var visibilityState: VisibilityState = .pinned
     private var restoreHotspotRequiresReentry = false
@@ -254,7 +260,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         visibilityState = .hidden
         restoreHotspotRequiresReentry = isInRestoreHotspot(NSEvent.mouseLocation)
         previewLastInsideAt = nil
-        previewEntryLocation = nil
+        resetPreviewIntentTracking()
         stopPreviewHoverPolling()
         stopPreviewClickMonitors()
         bubbleWindow?.hideHoverMenuImmediately()
@@ -268,7 +274,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         visibilityState = .pinned
         restoreHotspotRequiresReentry = false
         previewLastInsideAt = nil
-        previewEntryLocation = nil
+        resetPreviewIntentTracking()
         stopPreviewHoverPolling()
         stopPreviewClickMonitors()
         hideRestoreHotspots()
@@ -338,7 +344,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         advancePresentationGeneration()
         visibilityState = .peek
         restoreHotspotRequiresReentry = false
-        previewEntryLocation = NSEvent.mouseLocation
+        startPreviewIntentTracking(at: NSEvent.mouseLocation)
         hideRestoreHotspots()
         startPreviewClickMonitors()
         startPreviewHoverPolling()
@@ -356,7 +362,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         visibilityState = .hidden
         restoreHotspotRequiresReentry = isInRestoreHotspot(NSEvent.mouseLocation)
         previewLastInsideAt = nil
-        previewEntryLocation = nil
+        resetPreviewIntentTracking()
         stopPreviewHoverPolling()
         stopPreviewClickMonitors()
         bubbleWindow?.hideHoverMenuImmediately()
@@ -409,23 +415,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         previewHoverPollTimer = nil
     }
 
+    private func startPreviewIntentTracking(at location: NSPoint) {
+        let now = Date()
+        previewEntryLocation = location
+        previewIntentLastLocation = location
+        previewIntentLastProgressAt = now
+        previewIntentBestProgress = 0
+    }
+
+    private func resetPreviewIntentTracking() {
+        previewEntryLocation = nil
+        previewIntentLastLocation = nil
+        previewIntentLastProgressAt = nil
+        previewIntentBestProgress = 0
+    }
+
     private func checkPreviewHover() {
         guard visibilityState == .peek else { return }
 
+        let now = Date()
         let location = NSEvent.mouseLocation
         if handlePreviewMousePressIfNeeded(at: location) {
             return
         }
 
-        if isInRestoreHotspot(location) || isFloatingUILocation(location) || isInPreviewIntentPath(location) {
-            previewLastInsideAt = Date()
+        if isInRestoreHotspot(location) || isFloatingUILocation(location) {
+            previewLastInsideAt = now
+        } else if shouldKeepPreviewForIntentPath(at: location, now: now) {
+            previewLastInsideAt = now
         } else {
-            let leftAt = previewLastInsideAt ?? Date()
+            let leftAt = previewLastInsideAt ?? now
             previewLastInsideAt = leftAt
-            if Date().timeIntervalSince(leftAt) >= previewHideDelay {
+            if now.timeIntervalSince(leftAt) >= previewHideDelay {
                 hidePreviewFromHidden()
             }
         }
+    }
+
+    private func shouldKeepPreviewForIntentPath(at location: NSPoint, now: Date) -> Bool {
+        guard isInPreviewIntentPath(location),
+              let progress = previewIntentProgress(at: location, from: previewIntentLastLocation) else {
+            return false
+        }
+
+        let lastProgressAt = previewIntentLastProgressAt ?? now
+        defer { previewIntentLastLocation = location }
+
+        if progress.movement >= previewIntentMovementThreshold,
+           (progress.progress >= previewIntentBestProgress + previewIntentProgressThreshold || progress.movementTowardTarget >= previewIntentMovementThreshold) {
+            previewIntentBestProgress = max(previewIntentBestProgress, progress.progress)
+            previewIntentLastProgressAt = now
+            return true
+        }
+
+        return now.timeIntervalSince(lastProgressAt) <= previewIntentStallDelay
     }
 
     private func isInPreviewIntentPath(_ location: NSPoint) -> Bool {
@@ -464,6 +507,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return frames
     }
 
+    private func previewIntentProgress(at location: NSPoint, from previousLocation: NSPoint?) -> (progress: CGFloat, movement: CGFloat, movementTowardTarget: CGFloat)? {
+        guard let entryLocation = previewEntryLocation else {
+            return nil
+        }
+
+        let previousLocation = previousLocation ?? entryLocation
+        let movement = distance(from: previousLocation, to: location)
+        var bestProgress: CGFloat = -CGFloat.greatestFiniteMagnitude
+        var bestMovementTowardTarget: CGFloat = -CGFloat.greatestFiniteMagnitude
+
+        for targetFrame in previewIntentTargetFrames() where isLocation(location, inIntentPathFrom: entryLocation, to: targetFrame) {
+            let targetPoint = previewIntentTargetPoint(from: entryLocation, to: targetFrame)
+            let targetVector = NSPoint(x: targetPoint.x - entryLocation.x, y: targetPoint.y - entryLocation.y)
+            let targetLengthSquared = targetVector.x * targetVector.x + targetVector.y * targetVector.y
+            guard targetLengthSquared > 1 else {
+                continue
+            }
+
+            let currentVector = NSPoint(x: location.x - entryLocation.x, y: location.y - entryLocation.y)
+            let movementVector = NSPoint(x: location.x - previousLocation.x, y: location.y - previousLocation.y)
+            let progress = clamped(
+                (currentVector.x * targetVector.x + currentVector.y * targetVector.y) / targetLengthSquared,
+                min: 0,
+                max: 1
+            )
+            let movementTowardTarget = (movementVector.x * targetVector.x + movementVector.y * targetVector.y) / sqrt(targetLengthSquared)
+
+            if progress > bestProgress {
+                bestProgress = progress
+                bestMovementTowardTarget = movementTowardTarget
+            }
+        }
+
+        guard bestProgress.isFinite else {
+            return nil
+        }
+
+        return (
+            progress: bestProgress,
+            movement: movement,
+            movementTowardTarget: bestMovementTowardTarget
+        )
+    }
+
+    private func previewIntentTargetPoint(from entryLocation: NSPoint, to targetFrame: NSRect) -> NSPoint {
+        let paddedTarget = targetFrame.insetBy(dx: -previewIntentPadding, dy: -previewIntentPadding)
+        return NSPoint(
+            x: min(paddedTarget.maxX, entryLocation.x),
+            y: clamped(entryLocation.y, min: paddedTarget.minY, max: paddedTarget.maxY)
+        )
+    }
+
     private func isLocation(_ location: NSPoint, inIntentPathFrom entryLocation: NSPoint, to targetFrame: NSRect) -> Bool {
         let paddedTarget = targetFrame.insetBy(dx: -previewIntentPadding, dy: -previewIntentPadding)
         if paddedTarget.contains(location) {
@@ -487,6 +582,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let third = 1 - first - second
         let tolerance: CGFloat = 0.02
         return first >= -tolerance && second >= -tolerance && third >= -tolerance
+    }
+
+    private func distance(from first: NSPoint, to second: NSPoint) -> CGFloat {
+        let deltaX = first.x - second.x
+        let deltaY = first.y - second.y
+        return sqrt(deltaX * deltaX + deltaY * deltaY)
+    }
+
+    private func clamped(_ value: CGFloat, min lowerBound: CGFloat, max upperBound: CGFloat) -> CGFloat {
+        min(max(value, lowerBound), upperBound)
     }
 
     private func handlePreviewMousePressIfNeeded(at location: NSPoint) -> Bool {
