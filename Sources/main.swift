@@ -6,6 +6,7 @@ private let stickerSize: CGFloat = 320
 private let resizeHandleSize: CGFloat = 18
 private let resizeEdgeThickness: CGFloat = 10
 private let minimumStickerSize = NSSize(width: 220, height: 180)
+private let previewShowDelay: TimeInterval = 0.12
 private let previewHideDelay: TimeInterval = 0.06
 private let previewPollInterval: TimeInterval = 0.03
 private let previewIntentPadding: CGFloat = 44
@@ -91,6 +92,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var saveTimer: Timer?
     private var previewLocalClickMonitor: Any?
     private var previewGlobalClickMonitor: Any?
+    private var previewShowWorkItem: DispatchWorkItem?
     private var previewHoverPollTimer: Timer?
     private var previewLastInsideAt: Date?
     private var previewEntryLocation: NSPoint?
@@ -300,6 +302,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             window.onExit = { [weak self] in
                 self?.restoreHotspotRequiresReentry = false
+                self?.cancelPreviewShowFromHidden()
             }
             return window
         }
@@ -308,6 +311,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func hideRestoreHotspots() {
+        cancelPreviewShowFromHidden()
         restoreHotspotWindows.forEach { window in
             window.orderOut(nil)
             window.close()
@@ -318,7 +322,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func handleRestoreHotspotHover() {
         guard visibilityState == .hidden else { return }
         guard !restoreHotspotRequiresReentry else { return }
-        showPreviewFromHidden()
+        schedulePreviewFromHidden()
+    }
+
+    private func schedulePreviewFromHidden() {
+        guard previewShowWorkItem == nil else { return }
+
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.previewShowWorkItem = nil
+            guard self.visibilityState == .hidden,
+                  !self.restoreHotspotRequiresReentry,
+                  self.isInRestoreHotspot(NSEvent.mouseLocation) else {
+                return
+            }
+
+            self.showPreviewFromHidden()
+        }
+        previewShowWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + previewShowDelay, execute: workItem)
+    }
+
+    private func cancelPreviewShowFromHidden() {
+        previewShowWorkItem?.cancel()
+        previewShowWorkItem = nil
     }
 
     private func isInRestoreHotspot(_ location: NSPoint) -> Bool {
@@ -341,6 +368,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func showPreviewFromHidden() {
         guard visibilityState == .hidden else { return }
 
+        cancelPreviewShowFromHidden()
         advancePresentationGeneration()
         visibilityState = .peek
         restoreHotspotRequiresReentry = false
@@ -358,6 +386,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func hidePreviewFromHidden() {
         guard visibilityState == .peek || visibilityState == .hidden else { return }
 
+        cancelPreviewShowFromHidden()
         advancePresentationGeneration()
         visibilityState = .hidden
         restoreHotspotRequiresReentry = isInRestoreHotspot(NSEvent.mouseLocation)
