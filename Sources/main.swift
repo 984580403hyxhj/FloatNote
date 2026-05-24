@@ -106,7 +106,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var isRestoringStickerWindows = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.setActivationPolicy(.accessory)
+        NSApp.setActivationPolicy(.regular)
         showBubble()
         restoreStoredStickers()
     }
@@ -3630,5 +3630,5 @@ final class DragHeaderView: NSView {
 let application = NSApplication.shared
 let appDelegate = AppDelegate()
 application.delegate = appDelegate
-application.setActivationPolicy(.accessory)
+application.setActivationPolicy(.regular)
 application.run()
