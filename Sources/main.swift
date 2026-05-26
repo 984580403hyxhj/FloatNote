@@ -2255,31 +2255,29 @@ private enum MarkdownPipeTableParser {
         }
 
         var dashScore = 0
-        var hasWideDash = false
         for character in marker {
             if character.isWhitespace || isAlignmentColon(character) {
                 continue
             }
-            guard let dash = separatorDash(for: character) else {
+            guard let score = separatorDashScore(for: character) else {
                 return false
             }
-            dashScore += dash.score
-            hasWideDash = hasWideDash || dash.isWide
+            dashScore += score
         }
 
-        return dashScore >= 3 || (hasWideDash && dashScore >= 2)
+        return dashScore >= 2
     }
 
     private static func isAlignmentColon(_ character: Character) -> Bool {
         character == ":" || character == "："
     }
 
-    private static func separatorDash(for character: Character) -> (score: Int, isWide: Bool)? {
+    private static func separatorDashScore(for character: Character) -> Int? {
         switch character {
         case "-":
-            return (1, false)
+            return 1
         case "‐", "‑", "‒", "–", "—", "―", "−", "﹘", "﹣", "－", "─", "━":
-            return (2, true)
+            return 2
         default:
             return nil
         }
