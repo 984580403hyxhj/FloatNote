@@ -37,5 +37,6 @@ swiftc "$ROOT_DIR/Sources/main.swift" \
 
 cp "$ROOT_DIR/Info.plist" "$CONTENTS_DIR/Info.plist"
 chmod +x "$MACOS_DIR/$APP_NAME"
+codesign --force --deep --sign - "$APP_DIR"
 
 echo "$APP_DIR"
