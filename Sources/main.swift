@@ -3373,7 +3373,7 @@ final class MarkdownPreviewView: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
-        if event.clickCount >= 3 {
+        if event.clickCount >= 2 {
             onBeginEditing?()
             return
         }
