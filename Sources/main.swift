@@ -319,7 +319,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             selectionWindow?.orderOut(nil)
             selectionWindow?.close()
             self?.regionSelectionWindow = nil
-            self?.createLiveRegion(sourceRect: sourceRect)
+            self?.createLiveRegion(fromSelectedScreenRect: sourceRect)
         }
         regionSelectionWindow = selectionWindow
         selectionWindow.orderFrontRegardless()
@@ -344,9 +344,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return false
     }
 
-    private func createLiveRegion(sourceRect: NSRect) {
-        guard sourceRect.width >= minimumLiveRegionSelectionSize.width,
-              sourceRect.height >= minimumLiveRegionSelectionSize.height else {
+    private func createLiveRegion(fromSelectedScreenRect selectedRect: NSRect) {
+        guard selectedRect.width >= minimumLiveRegionSelectionSize.width,
+              selectedRect.height >= minimumLiveRegionSelectionSize.height,
+              let sourceRect = screenCaptureRect(fromAppKitScreenRect: selectedRect) else {
             return
         }
 
@@ -358,6 +359,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         liveRegionWindows.append(window)
         window.orderFrontRegardless()
         scheduleSave()
+    }
+
+    private func screenCaptureRect(fromAppKitScreenRect selectedRect: NSRect) -> NSRect? {
+        let selectedRect = selectedRect.standardized
+        let screen = NSScreen.screens
+            .map { screen in
+                (screen: screen, area: selectedRect.intersection(screen.frame).area)
+            }
+            .filter { $0.area > 0 }
+            .max { left, right in left.area < right.area }?
+            .screen
+
+        guard let screen,
+              let displayIDNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else {
+            return nil
+        }
+
+        let appKitIntersection = selectedRect.intersection(screen.frame).standardized
+        let displayBounds = CGDisplayBounds(CGDirectDisplayID(displayIDNumber.uint32Value))
+        return NSRect(
+            x: displayBounds.minX + appKitIntersection.minX - screen.frame.minX,
+            y: displayBounds.minY + screen.frame.maxY - appKitIntersection.maxY,
+            width: appKitIntersection.width,
+            height: appKitIntersection.height
+        )
     }
 
     private func defaultLiveRegionFrame(for sourceRect: NSRect) -> NSRect {
@@ -1298,6 +1324,15 @@ private extension NSWindow {
     }
 }
 
+private extension NSRect {
+    var area: CGFloat {
+        guard !isNull, !isEmpty else {
+            return 0
+        }
+        return width * height
+    }
+}
+
 final class RegionSelectionWindow: NSWindow {
     var onComplete: ((NSRect) -> Void)? {
         didSet { selectionView.onComplete = onComplete }
@@ -2154,6 +2189,7 @@ final class LiveRegionView: NSView {
     private var refreshTimer: Timer?
     private var lastImage: NSImage?
     private var lastCaptureSucceeded = false
+    private var captureStatusText = "Waiting for capture"
     private var isCaptureInFlight = false
 
     init(frame frameRect: NSRect, sourceRect: NSRect) {
@@ -2311,11 +2347,17 @@ final class LiveRegionView: NSView {
         }
 
         isCaptureInFlight = true
-        SCScreenshotManager.captureImage(in: sourceRect) { [weak self] image, _ in
+        SCScreenshotManager.captureImage(in: sourceRect) { [weak self] image, error in
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.isCaptureInFlight = false
                 guard let image else {
+                    if let error {
+                        NSLog("FloatNote live region capture failed: \(error.localizedDescription)")
+                        self.captureStatusText = error.localizedDescription
+                    } else {
+                        self.captureStatusText = "Capture unavailable"
+                    }
                     self.lastCaptureSucceeded = false
                     self.needsDisplay = true
                     return
@@ -2323,13 +2365,14 @@ final class LiveRegionView: NSView {
 
                 self.lastImage = NSImage(cgImage: image, size: self.sourceRect.size)
                 self.lastCaptureSucceeded = true
+                self.captureStatusText = "Live Region"
                 self.needsDisplay = true
             }
         }
     }
 
     private func drawHeaderText(in headerRect: NSRect) {
-        let status = lastCaptureSucceeded ? "Live Region" : "Live Region - waiting"
+        let status = lastCaptureSucceeded ? "Live Region" : "Live Region - \(captureStatusText)"
         let attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 12.5, weight: .semibold),
             .foregroundColor: NSColor.white.withAlphaComponent(0.86)
@@ -2354,7 +2397,7 @@ final class LiveRegionView: NSView {
         NSColor.black.withAlphaComponent(0.20).setFill()
         NSBezierPath(roundedRect: rect, xRadius: 5, yRadius: 5).fill()
 
-        let text = "Waiting for capture"
+        let text = captureStatusText
         let attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 13, weight: .medium),
             .foregroundColor: NSColor.white.withAlphaComponent(0.62)
