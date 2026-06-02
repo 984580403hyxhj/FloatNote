@@ -1,5 +1,6 @@
 import AppKit
 import QuartzCore
+import ScreenCaptureKit
 
 private let bubbleSize: CGFloat = 52
 private let stickerSize: CGFloat = 320
@@ -27,6 +28,8 @@ private let minimumStickerFontSize: CGFloat = 8
 private let maximumStickerFontSize: CGFloat = 28
 private let minimumStickerZoomScale: CGFloat = 0.38
 private let maximumStickerZoomScale: CGFloat = 1.80
+private let liveRegionRefreshInterval: TimeInterval = 0.10
+private let minimumLiveRegionSelectionSize = NSSize(width: 48, height: 36)
 
 private enum StickerInteractionMode {
     case display
@@ -41,6 +44,19 @@ fileprivate struct StoredSticker: Codable {
     let height: Double
     let text: String
     let zoom: Double?
+    let zIndex: Int?
+}
+
+fileprivate struct StoredLiveRegion: Codable {
+    let id: UUID
+    let x: Double
+    let y: Double
+    let width: Double
+    let height: Double
+    let sourceX: Double
+    let sourceY: Double
+    let sourceWidth: Double
+    let sourceHeight: Double
     let zIndex: Int?
 }
 
@@ -78,6 +94,40 @@ private final class StickerStorage {
     }
 }
 
+private final class LiveRegionStorage {
+    private var fileURL: URL {
+        let baseURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        return baseURL.appendingPathComponent("FloatingSticker", isDirectory: true)
+            .appendingPathComponent("live-regions.json")
+    }
+
+    func load() -> [StoredLiveRegion] {
+        do {
+            let data = try Data(contentsOf: fileURL)
+            return try JSONDecoder().decode([StoredLiveRegion].self, from: data)
+        } catch CocoaError.fileReadNoSuchFile {
+            return []
+        } catch {
+            NSLog("FloatingSticker live region load failed: \(error)")
+            return []
+        }
+    }
+
+    func save(_ records: [StoredLiveRegion]) {
+        do {
+            let folderURL = fileURL.deletingLastPathComponent()
+            try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
+
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            let data = try encoder.encode(records)
+            try data.write(to: fileURL, options: .atomic)
+        } catch {
+            NSLog("FloatingSticker live region save failed: \(error)")
+        }
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private enum VisibilityState {
         case pinned
@@ -87,9 +137,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var bubbleWindow: BubbleWindow?
     private var stickerWindows: [StickerWindow] = []
+    private var liveRegionWindows: [LiveRegionWindow] = []
     private var restoreHotspotWindows: [RestoreHotspotWindow] = []
     private let storage = StickerStorage()
+    private let liveRegionStorage = LiveRegionStorage()
     private var saveTimer: Timer?
+    private var regionSelectionWindow: RegionSelectionWindow?
     private var previewLocalClickMonitor: Any?
     private var previewGlobalClickMonitor: Any?
     private var previewShowWorkItem: DispatchWorkItem?
@@ -109,10 +162,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.regular)
         showBubble()
         restoreStoredStickers()
+        restoreStoredLiveRegions()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         saveStickerState()
+    }
+
+    func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
+        let menu = NSMenu()
+        menu.addItem(NSMenuItem(title: "New Sticker", action: #selector(createStickerFromMenu), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "New Live Region", action: #selector(createLiveRegionFromMenu), keyEquivalent: ""))
+        menu.addItem(.separator())
+        menu.addItem(NSMenuItem(title: "Hide All Notes", action: #selector(hideAllFromMenu), keyEquivalent: ""))
+        menu.items.forEach { $0.target = self }
+        return menu
+    }
+
+    @objc private func createStickerFromMenu() {
+        createSticker()
+    }
+
+    @objc private func createLiveRegionFromMenu() {
+        beginLiveRegionSelection()
+    }
+
+    @objc private func hideAllFromMenu() {
+        hideAll()
     }
 
     private func showBubble() {
@@ -125,6 +201,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let window = BubbleWindow(contentRect: NSRect(origin: origin, size: NSSize(width: bubbleSize, height: bubbleSize)))
         window.onCreateSticker = { [weak self] in
             self?.createSticker()
+        }
+        window.onCreateLiveRegion = { [weak self] in
+            self?.beginLiveRegionSelection()
         }
         window.onHideAll = { [weak self] in
             self?.hideAll()
@@ -163,6 +242,85 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         scheduleSave()
     }
 
+    private func beginLiveRegionSelection() {
+        NSApp.activate(ignoringOtherApps: true)
+        guard ensureScreenCaptureAccess() else { return }
+
+        regionSelectionWindow?.orderOut(nil)
+        regionSelectionWindow?.close()
+
+        let screenFrame = NSScreen.screens.map(\.frame).reduce(NSRect.null) { partial, frame in
+            partial.union(frame)
+        }
+        let selectionWindow = RegionSelectionWindow(contentRect: screenFrame)
+        selectionWindow.onCancel = { [weak self, weak selectionWindow] in
+            selectionWindow?.orderOut(nil)
+            selectionWindow?.close()
+            self?.regionSelectionWindow = nil
+        }
+        selectionWindow.onComplete = { [weak self, weak selectionWindow] sourceRect in
+            selectionWindow?.orderOut(nil)
+            selectionWindow?.close()
+            self?.regionSelectionWindow = nil
+            self?.createLiveRegion(sourceRect: sourceRect)
+        }
+        regionSelectionWindow = selectionWindow
+        selectionWindow.orderFrontRegardless()
+        selectionWindow.makeKey()
+    }
+
+    private func ensureScreenCaptureAccess() -> Bool {
+        if CGPreflightScreenCaptureAccess() {
+            return true
+        }
+
+        let granted = CGRequestScreenCaptureAccess()
+        if granted {
+            return true
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "Screen Recording Permission Required"
+        alert.informativeText = "FloatNote needs Screen Recording permission to create Live Region stickers. Enable it in System Settings, then try again."
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+        return false
+    }
+
+    private func createLiveRegion(sourceRect: NSRect) {
+        guard sourceRect.width >= minimumLiveRegionSelectionSize.width,
+              sourceRect.height >= minimumLiveRegionSelectionSize.height else {
+            return
+        }
+
+        let window = makeLiveRegionWindow(
+            id: UUID(),
+            frame: defaultLiveRegionFrame(for: sourceRect),
+            sourceRect: sourceRect
+        )
+        liveRegionWindows.append(window)
+        window.orderFrontRegardless()
+        scheduleSave()
+    }
+
+    private func defaultLiveRegionFrame(for sourceRect: NSRect) -> NSRect {
+        let visibleFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1200, height: 800)
+        let maxWidth: CGFloat = 460
+        let maxHeight: CGFloat = 340
+        let scale = min(maxWidth / sourceRect.width, maxHeight / sourceRect.height, 1)
+        let contentSize = NSSize(
+            width: max(minimumStickerSize.width, sourceRect.width * scale),
+            height: max(minimumStickerSize.height - 34, sourceRect.height * scale)
+        )
+        let size = NSSize(width: contentSize.width, height: contentSize.height + 34)
+        return NSRect(
+            x: visibleFrame.maxX - size.width - 86,
+            y: visibleFrame.maxY - size.height - 86,
+            width: size.width,
+            height: size.height
+        )
+    }
+
     private func makeStickerWindow(id: UUID, frame: NSRect, text: String, zoomScale: CGFloat) -> StickerWindow {
         let window = StickerWindow(id: id, contentRect: frame, text: text, zoomScale: zoomScale)
         window.onClose = { [weak self, weak window] in
@@ -180,6 +338,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.onActivate = { [weak self, weak window] in
             guard let self, let window else { return }
             self.bringStickerToFront(window)
+        }
+        return window
+    }
+
+    private func makeLiveRegionWindow(id: UUID, frame: NSRect, sourceRect: NSRect) -> LiveRegionWindow {
+        let window = LiveRegionWindow(id: id, contentRect: frame, sourceRect: sourceRect)
+        window.onClose = { [weak self, weak window] in
+            guard let self, let window else { return }
+            self.liveRegionWindows.removeAll { $0 === window }
+            window.close()
+            self.saveStickerState()
+        }
+        window.onChange = { [weak self] in
+            self?.scheduleSave()
+        }
+        window.onActivate = { [weak self, weak window] in
+            guard let self, let window else { return }
+            self.bringLiveRegionToFront(window)
         }
         return window
     }
@@ -212,7 +388,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func restoreStoredLiveRegions() {
+        let records = liveRegionStorage.load().enumerated().sorted { left, right in
+            let leftZIndex = left.element.zIndex ?? left.offset
+            let rightZIndex = right.element.zIndex ?? right.offset
+            if leftZIndex == rightZIndex {
+                return left.offset < right.offset
+            }
+            return leftZIndex < rightZIndex
+        }.map(\.element)
+
+        for record in records {
+            let window = makeLiveRegionWindow(
+                id: record.id,
+                frame: restoredFrame(for: record),
+                sourceRect: NSRect(
+                    x: CGFloat(record.sourceX),
+                    y: CGFloat(record.sourceY),
+                    width: CGFloat(record.sourceWidth),
+                    height: CGFloat(record.sourceHeight)
+                )
+            )
+            liveRegionWindows.append(window)
+            window.orderFrontRegardless()
+        }
+
+        if !liveRegionWindows.isEmpty {
+            saveStickerState()
+        }
+    }
+
     private func restoredFrame(for record: StoredSticker) -> NSRect {
+        let frame = NSRect(
+            x: CGFloat(record.x),
+            y: CGFloat(record.y),
+            width: max(minimumStickerSize.width, CGFloat(record.width)),
+            height: max(minimumStickerSize.height, CGFloat(record.height))
+        )
+
+        if NSScreen.screens.contains(where: { $0.visibleFrame.intersects(frame) }) {
+            return frame
+        }
+
+        let visibleFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1200, height: 800)
+        return NSRect(
+            x: visibleFrame.midX - frame.width / 2,
+            y: visibleFrame.midY - frame.height / 2,
+            width: frame.width,
+            height: frame.height
+        )
+    }
+
+    private func restoredFrame(for record: StoredLiveRegion) -> NSRect {
         let frame = NSRect(
             x: CGFloat(record.x),
             y: CGFloat(record.y),
@@ -243,6 +470,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if index != stickerWindows.index(before: stickerWindows.endIndex) {
             stickerWindows.remove(at: index)
             stickerWindows.append(window)
+        }
+
+        if window.isVisible {
+            window.orderFrontRegardless()
+        }
+        bringFloatingUIToFront()
+        scheduleSave()
+    }
+
+    private func bringLiveRegionToFront(_ window: LiveRegionWindow) {
+        guard let index = liveRegionWindows.firstIndex(where: { $0 === window }) else {
+            return
+        }
+
+        if index != liveRegionWindows.index(before: liveRegionWindows.endIndex) {
+            liveRegionWindows.remove(at: index)
+            liveRegionWindows.append(window)
         }
 
         if window.isVisible {
@@ -773,11 +1017,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         storage.save(stickerWindows.enumerated().map { index, window in
             window.storedRecord(zIndex: index)
         })
+        liveRegionStorage.save(liveRegionWindows.enumerated().map { index, window in
+            window.storedRecord(zIndex: index)
+        })
     }
 }
 
 final class BubbleWindow: NSWindow {
     var onCreateSticker: (() -> Void)?
+    var onCreateLiveRegion: (() -> Void)?
     var onHideAll: (() -> Void)?
     var onQuit: (() -> Void)?
 
@@ -807,6 +1055,7 @@ final class BubbleWindow: NSWindow {
 
         let button = BubbleButton(frame: NSRect(origin: .zero, size: contentRect.size))
         button.onCreateSticker = { [weak self] in self?.onCreateSticker?() }
+        button.onCreateLiveRegion = { [weak self] in self?.onCreateLiveRegion?() }
         button.onHideAll = { [weak self] in self?.onHideAll?() }
         button.onQuit = { [weak self] in self?.onQuit?() }
         button.onHoverChanged = { [weak self] hovering in
@@ -973,6 +1222,187 @@ private extension NSWindow {
     }
 }
 
+final class RegionSelectionWindow: NSWindow {
+    var onComplete: ((NSRect) -> Void)? {
+        didSet { selectionView.onComplete = onComplete }
+    }
+
+    var onCancel: (() -> Void)? {
+        didSet { selectionView.onCancel = onCancel }
+    }
+
+    private let selectionView: RegionSelectionView
+
+    init(contentRect: NSRect) {
+        selectionView = RegionSelectionView(frame: NSRect(origin: .zero, size: contentRect.size))
+
+        super.init(
+            contentRect: contentRect,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+
+        isOpaque = false
+        backgroundColor = .clear
+        hasShadow = false
+        sharingType = .none
+        level = .screenSaver
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        isReleasedWhenClosed = false
+        acceptsMouseMovedEvents = true
+        contentView = selectionView
+    }
+
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
+
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 53 {
+            onCancel?()
+            return
+        }
+        super.keyDown(with: event)
+    }
+}
+
+final class RegionSelectionView: NSView {
+    var onComplete: ((NSRect) -> Void)?
+    var onCancel: (() -> Void)?
+
+    private var dragStart: NSPoint?
+    private var dragCurrent: NSPoint?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        true
+    }
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .crosshair)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        dragStart = point
+        dragCurrent = point
+        needsDisplay = true
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        dragCurrent = convert(event.locationInWindow, from: nil)
+        needsDisplay = true
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        dragCurrent = convert(event.locationInWindow, from: nil)
+        guard let selectedRect = selectedScreenRect(),
+              selectedRect.width >= minimumLiveRegionSelectionSize.width,
+              selectedRect.height >= minimumLiveRegionSelectionSize.height else {
+            clearSelection()
+            return
+        }
+
+        onComplete?(selectedRect)
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        onCancel?()
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.black.withAlphaComponent(0.28).setFill()
+        bounds.fill()
+
+        guard let selectionRect = selectedLocalRect() else {
+            drawPrompt()
+            return
+        }
+
+        NSColor.white.withAlphaComponent(0.10).setFill()
+        selectionRect.fill()
+
+        NSColor(calibratedRed: 0.23, green: 0.58, blue: 1.0, alpha: 1.0).setStroke()
+        let path = NSBezierPath(roundedRect: selectionRect, xRadius: 5, yRadius: 5)
+        path.lineWidth = 2
+        path.stroke()
+
+        drawSelectionSize(in: selectionRect)
+    }
+
+    private func drawPrompt() {
+        let text = "Drag to capture a live region"
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 18, weight: .semibold),
+            .foregroundColor: NSColor.white.withAlphaComponent(0.88)
+        ]
+        let size = (text as NSString).size(withAttributes: attributes)
+        let rect = NSRect(x: bounds.midX - size.width / 2, y: bounds.midY - size.height / 2, width: size.width, height: size.height)
+        (text as NSString).draw(in: rect, withAttributes: attributes)
+    }
+
+    private func drawSelectionSize(in selectionRect: NSRect) {
+        let text = "\(Int(selectionRect.width)) x \(Int(selectionRect.height))"
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium),
+            .foregroundColor: NSColor.white
+        ]
+        let size = (text as NSString).size(withAttributes: attributes)
+        let labelRect = NSRect(
+            x: selectionRect.minX,
+            y: max(8, selectionRect.minY - size.height - 8),
+            width: size.width + 12,
+            height: size.height + 6
+        )
+        NSColor.black.withAlphaComponent(0.55).setFill()
+        NSBezierPath(roundedRect: labelRect, xRadius: 4, yRadius: 4).fill()
+        (text as NSString).draw(
+            in: labelRect.insetBy(dx: 6, dy: 3),
+            withAttributes: attributes
+        )
+    }
+
+    private func selectedLocalRect() -> NSRect? {
+        guard let dragStart, let dragCurrent else {
+            return nil
+        }
+
+        return NSRect(
+            x: min(dragStart.x, dragCurrent.x),
+            y: min(dragStart.y, dragCurrent.y),
+            width: abs(dragCurrent.x - dragStart.x),
+            height: abs(dragCurrent.y - dragStart.y)
+        )
+    }
+
+    private func selectedScreenRect() -> NSRect? {
+        guard let localRect = selectedLocalRect(), let window else {
+            return nil
+        }
+
+        return NSRect(
+            x: window.frame.minX + localRect.minX,
+            y: window.frame.minY + localRect.minY,
+            width: localRect.width,
+            height: localRect.height
+        )
+    }
+
+    private func clearSelection() {
+        dragStart = nil
+        dragCurrent = nil
+        needsDisplay = true
+    }
+}
+
 final class RestoreHotspotWindow: NSWindow {
     var onHover: (() -> Void)? {
         didSet { hotspotView.onHover = onHover }
@@ -1068,6 +1498,7 @@ final class RestoreHotspotView: NSView {
 
 final class BubbleButton: NSButton {
     var onCreateSticker: (() -> Void)?
+    var onCreateLiveRegion: (() -> Void)?
     var onHideAll: (() -> Void)?
     var onQuit: (() -> Void)?
     var onHoverChanged: ((Bool) -> Void)?
@@ -1145,6 +1576,7 @@ final class BubbleButton: NSButton {
     private func showMenu(for event: NSEvent) {
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "New Sticker", action: #selector(createStickerFromMenu), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "New Live Region", action: #selector(createLiveRegionFromMenu), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Hide All", action: #selector(hideAllFromMenu), keyEquivalent: ""))
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit FloatingSticker", action: #selector(quitFromMenu), keyEquivalent: ""))
@@ -1154,6 +1586,10 @@ final class BubbleButton: NSButton {
 
     @objc private func createStickerFromMenu() {
         onCreateSticker?()
+    }
+
+    @objc private func createLiveRegionFromMenu() {
+        onCreateLiveRegion?()
     }
 
     @objc private func hideAllFromMenu() {
@@ -1538,6 +1974,334 @@ final class ZoomControlView: NSView {
         case .zoomIn:
             return NSRect(x: bounds.maxX - sideWidth, y: bounds.minY, width: sideWidth, height: bounds.height)
         }
+    }
+}
+
+final class LiveRegionWindow: NSPanel {
+    let id: UUID
+    var onClose: (() -> Void)?
+    var onChange: (() -> Void)?
+    var onActivate: (() -> Void)?
+
+    private let sourceRect: NSRect
+    private weak var liveRegionView: LiveRegionView?
+
+    fileprivate func storedRecord(zIndex: Int) -> StoredLiveRegion {
+        StoredLiveRegion(
+            id: id,
+            x: Double(frame.origin.x),
+            y: Double(frame.origin.y),
+            width: Double(frame.width),
+            height: Double(frame.height),
+            sourceX: Double(sourceRect.origin.x),
+            sourceY: Double(sourceRect.origin.y),
+            sourceWidth: Double(sourceRect.width),
+            sourceHeight: Double(sourceRect.height),
+            zIndex: zIndex
+        )
+    }
+
+    init(id: UUID, contentRect: NSRect, sourceRect: NSRect) {
+        self.id = id
+        self.sourceRect = sourceRect
+        super.init(
+            contentRect: contentRect,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+
+        isOpaque = false
+        backgroundColor = .clear
+        hasShadow = true
+        sharingType = .none
+        level = stickerWindowLevel
+        hidesOnDeactivate = false
+        isReleasedWhenClosed = false
+        minSize = minimumStickerSize
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+
+        let liveRegionView = LiveRegionView(frame: NSRect(origin: .zero, size: contentRect.size), sourceRect: sourceRect)
+        liveRegionView.onClose = { [weak self] in self?.onClose?() }
+        contentView = liveRegionView
+        self.liveRegionView = liveRegionView
+
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(windowFrameChanged),
+            name: NSWindow.didMoveNotification,
+            object: self
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(windowFrameChanged),
+            name: NSWindow.didResizeNotification,
+            object: self
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(windowFocusGained),
+            name: NSWindow.didBecomeKeyNotification,
+            object: self
+        )
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
+
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
+
+    override func sendEvent(_ event: NSEvent) {
+        if event.type == .leftMouseDown || event.type == .rightMouseDown {
+            onActivate?()
+        }
+        super.sendEvent(event)
+    }
+
+    @objc private func windowFrameChanged() {
+        onChange?()
+    }
+
+    @objc private func windowFocusGained() {
+        onActivate?()
+    }
+}
+
+final class LiveRegionView: NSView {
+    var onClose: (() -> Void)?
+
+    private let sourceRect: NSRect
+    private let headerHeight: CGFloat = 34
+    private let closeButton = NSButton(frame: NSRect(x: 0, y: 0, width: 28, height: 22))
+    private var refreshTimer: Timer?
+    private var lastImage: NSImage?
+    private var lastCaptureSucceeded = false
+    private var isCaptureInFlight = false
+
+    init(frame frameRect: NSRect, sourceRect: NSRect) {
+        self.sourceRect = sourceRect
+        super.init(frame: frameRect)
+        wantsLayer = true
+        buildView()
+        captureFrame()
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    deinit {
+        stopRefreshing()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil {
+            stopRefreshing()
+        } else {
+            startRefreshing()
+        }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let rect = bounds.insetBy(dx: 1, dy: 1)
+        let path = NSBezierPath(roundedRect: rect, xRadius: 8, yRadius: 8)
+
+        NSColor(calibratedRed: 0.08, green: 0.10, blue: 0.13, alpha: 0.96).setFill()
+        path.fill()
+
+        NSGraphicsContext.saveGraphicsState()
+        path.addClip()
+        let headerRect = NSRect(x: rect.minX, y: rect.maxY - headerHeight, width: rect.width, height: headerHeight)
+        NSGradient(
+            starting: NSColor(calibratedRed: 0.19, green: 0.23, blue: 0.31, alpha: 0.98),
+            ending: NSColor(calibratedRed: 0.11, green: 0.14, blue: 0.20, alpha: 0.98)
+        )?.draw(in: headerRect, angle: 90)
+        NSGraphicsContext.restoreGraphicsState()
+
+        drawHeaderText(in: headerRect)
+        drawCaptureContent(in: contentRect)
+
+        NSColor.white.withAlphaComponent(0.14).setStroke()
+        path.lineWidth = 1
+        path.stroke()
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        closeButton.frame.origin = NSPoint(x: bounds.maxX - 38, y: bounds.maxY - 27)
+    }
+
+    private var contentRect: NSRect {
+        let insetBounds = bounds.insetBy(dx: 10, dy: 10)
+        return NSRect(
+            x: insetBounds.minX,
+            y: insetBounds.minY,
+            width: insetBounds.width,
+            height: max(0, insetBounds.height - headerHeight)
+        )
+    }
+
+    private func buildView() {
+        let dragHeader = DragHeaderView(frame: NSRect(x: 0, y: bounds.height - headerHeight, width: bounds.width, height: headerHeight))
+        dragHeader.autoresizingMask = [.width, .minYMargin]
+        addSubview(dragHeader)
+
+        addResizeHandles()
+
+        closeButton.title = "x"
+        closeButton.font = .systemFont(ofSize: 14, weight: .bold)
+        closeButton.isBordered = false
+        closeButton.target = self
+        closeButton.action = #selector(closeLiveRegion)
+        closeButton.contentTintColor = NSColor.white.withAlphaComponent(0.78)
+        closeButton.frame.origin = NSPoint(x: bounds.maxX - 38, y: bounds.maxY - 27)
+        closeButton.autoresizingMask = [.minXMargin, .maxYMargin]
+        addSubview(closeButton)
+    }
+
+    private func addResizeHandles() {
+        for handleType in ResizeHandleType.allCases {
+            let handle = ResizeHandleView(frame: frame(for: handleType), handleType: handleType)
+            handle.autoresizingMask = autoresizingMask(for: handleType)
+            addSubview(handle)
+        }
+    }
+
+    private func frame(for handleType: ResizeHandleType) -> NSRect {
+        let horizontalLength = max(0, bounds.width - resizeHandleSize * 2)
+        let verticalLength = max(0, bounds.height - resizeHandleSize * 2)
+
+        switch handleType {
+        case .topLeft:
+            return NSRect(x: 0, y: bounds.height - resizeHandleSize, width: resizeHandleSize, height: resizeHandleSize)
+        case .top:
+            return NSRect(x: resizeHandleSize, y: bounds.height - resizeEdgeThickness, width: horizontalLength, height: resizeEdgeThickness)
+        case .topRight:
+            return NSRect(x: bounds.width - resizeHandleSize, y: bounds.height - resizeHandleSize, width: resizeHandleSize, height: resizeHandleSize)
+        case .right:
+            return NSRect(x: bounds.width - resizeEdgeThickness, y: resizeHandleSize, width: resizeEdgeThickness, height: verticalLength)
+        case .bottomRight:
+            return NSRect(x: bounds.width - resizeHandleSize, y: 0, width: resizeHandleSize, height: resizeHandleSize)
+        case .bottom:
+            return NSRect(x: resizeHandleSize, y: 0, width: horizontalLength, height: resizeEdgeThickness)
+        case .bottomLeft:
+            return NSRect(x: 0, y: 0, width: resizeHandleSize, height: resizeHandleSize)
+        case .left:
+            return NSRect(x: 0, y: resizeHandleSize, width: resizeEdgeThickness, height: verticalLength)
+        }
+    }
+
+    private func autoresizingMask(for handleType: ResizeHandleType) -> NSView.AutoresizingMask {
+        switch handleType {
+        case .topLeft:
+            return [.maxXMargin, .minYMargin]
+        case .top:
+            return [.width, .minYMargin]
+        case .topRight:
+            return [.minXMargin, .minYMargin]
+        case .right:
+            return [.minXMargin, .height]
+        case .bottomRight:
+            return [.minXMargin, .maxYMargin]
+        case .bottom:
+            return [.width, .maxYMargin]
+        case .bottomLeft:
+            return [.maxXMargin, .maxYMargin]
+        case .left:
+            return [.maxXMargin, .height]
+        }
+    }
+
+    private func startRefreshing() {
+        guard refreshTimer == nil else { return }
+        let timer = Timer(timeInterval: liveRegionRefreshInterval, repeats: true) { [weak self] _ in
+            self?.captureFrame()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        refreshTimer = timer
+    }
+
+    private func stopRefreshing() {
+        refreshTimer?.invalidate()
+        refreshTimer = nil
+    }
+
+    private func captureFrame() {
+        guard !isCaptureInFlight else {
+            return
+        }
+
+        isCaptureInFlight = true
+        SCScreenshotManager.captureImage(in: sourceRect) { [weak self] image, _ in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.isCaptureInFlight = false
+                guard let image else {
+                    self.lastCaptureSucceeded = false
+                    self.needsDisplay = true
+                    return
+                }
+
+                self.lastImage = NSImage(cgImage: image, size: self.sourceRect.size)
+                self.lastCaptureSucceeded = true
+                self.needsDisplay = true
+            }
+        }
+    }
+
+    private func drawHeaderText(in headerRect: NSRect) {
+        let status = lastCaptureSucceeded ? "Live Region" : "Live Region - waiting"
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 12.5, weight: .semibold),
+            .foregroundColor: NSColor.white.withAlphaComponent(0.86)
+        ]
+        (status as NSString).draw(
+            in: NSRect(x: headerRect.minX + 14, y: headerRect.midY - 8, width: max(0, headerRect.width - 64), height: 18),
+            withAttributes: attributes
+        )
+    }
+
+    private func drawCaptureContent(in rect: NSRect) {
+        guard let lastImage else {
+            drawPlaceholder(in: rect)
+            return
+        }
+
+        let imageRect = aspectFitRect(for: lastImage.size, in: rect)
+        lastImage.draw(in: imageRect, from: .zero, operation: .copy, fraction: 1)
+    }
+
+    private func drawPlaceholder(in rect: NSRect) {
+        NSColor.black.withAlphaComponent(0.20).setFill()
+        NSBezierPath(roundedRect: rect, xRadius: 5, yRadius: 5).fill()
+
+        let text = "Waiting for capture"
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 13, weight: .medium),
+            .foregroundColor: NSColor.white.withAlphaComponent(0.62)
+        ]
+        let size = (text as NSString).size(withAttributes: attributes)
+        (text as NSString).draw(
+            in: NSRect(x: rect.midX - size.width / 2, y: rect.midY - size.height / 2, width: size.width, height: size.height),
+            withAttributes: attributes
+        )
+    }
+
+    private func aspectFitRect(for imageSize: NSSize, in rect: NSRect) -> NSRect {
+        guard imageSize.width > 0, imageSize.height > 0, rect.width > 0, rect.height > 0 else {
+            return rect
+        }
+
+        let scale = min(rect.width / imageSize.width, rect.height / imageSize.height)
+        let size = NSSize(width: imageSize.width * scale, height: imageSize.height * scale)
+        return NSRect(x: rect.midX - size.width / 2, y: rect.midY - size.height / 2, width: size.width, height: size.height)
+    }
+
+    @objc private func closeLiveRegion() {
+        onClose?()
     }
 }
 

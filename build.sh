@@ -32,7 +32,8 @@ iconutil -c icns "$ICONSET_DIR" -o "$RESOURCES_DIR/FloatNote.icns"
 
 swiftc "$ROOT_DIR/Sources/main.swift" \
   -o "$MACOS_DIR/$APP_NAME" \
-  -framework AppKit
+  -framework AppKit \
+  -framework ScreenCaptureKit
 
 cp "$ROOT_DIR/Info.plist" "$CONTENTS_DIR/Info.plist"
 chmod +x "$MACOS_DIR/$APP_NAME"

@@ -22,5 +22,7 @@
     <string>13.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>FloatNote uses screen capture to create Live Region stickers from areas you select.</string>
 </dict>
 </plist>
