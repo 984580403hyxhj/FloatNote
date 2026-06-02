@@ -143,6 +143,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let liveRegionStorage = LiveRegionStorage()
     private var saveTimer: Timer?
     private var regionSelectionWindow: RegionSelectionWindow?
+    private var pinnedLocalClickMonitor: Any?
+    private var pinnedGlobalClickMonitor: Any?
+    private var pinnedOutsideClickCount = 0
     private var previewLocalClickMonitor: Any?
     private var previewGlobalClickMonitor: Any?
     private var previewShowWorkItem: DispatchWorkItem?
@@ -161,11 +164,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         showBubble()
+        startPinnedOutsideClickMonitors()
         restoreStoredStickers()
         restoreStoredLiveRegions()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        stopPinnedOutsideClickMonitors()
         saveStickerState()
     }
 
@@ -189,6 +194,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func hideAllFromMenu() {
         hideAll()
+    }
+
+    private func startPinnedOutsideClickMonitors() {
+        guard pinnedLocalClickMonitor == nil, pinnedGlobalClickMonitor == nil else { return }
+
+        pinnedLocalClickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
+            self?.handlePinnedMouseClick(at: NSEvent.mouseLocation)
+            return event
+        }
+
+        pinnedGlobalClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
+            let clickLocation = NSEvent.mouseLocation
+            DispatchQueue.main.async {
+                self?.handlePinnedMouseClick(at: clickLocation)
+            }
+        }
+    }
+
+    private func stopPinnedOutsideClickMonitors() {
+        if let pinnedLocalClickMonitor {
+            NSEvent.removeMonitor(pinnedLocalClickMonitor)
+            self.pinnedLocalClickMonitor = nil
+        }
+
+        if let pinnedGlobalClickMonitor {
+            NSEvent.removeMonitor(pinnedGlobalClickMonitor)
+            self.pinnedGlobalClickMonitor = nil
+        }
+    }
+
+    private func resetPinnedOutsideClickCount() {
+        pinnedOutsideClickCount = 0
+    }
+
+    private func handlePinnedMouseClick(at location: NSPoint) {
+        guard visibilityState == .pinned else {
+            resetPinnedOutsideClickCount()
+            return
+        }
+
+        guard !isFloatNoteLocation(location) else {
+            resetPinnedOutsideClickCount()
+            return
+        }
+
+        pinnedOutsideClickCount += 1
+        if pinnedOutsideClickCount >= 2 {
+            resetPinnedOutsideClickCount()
+            hideAll()
+        }
     }
 
     private func showBubble() {
@@ -216,6 +271,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func createSticker() {
+        resetPinnedOutsideClickCount()
         NSApp.activate(ignoringOtherApps: true)
         if visibilityState != .pinned {
             restoreAll()
@@ -243,6 +299,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func beginLiveRegionSelection() {
+        resetPinnedOutsideClickCount()
         NSApp.activate(ignoringOtherApps: true)
         guard ensureScreenCaptureAccess() else { return }
 
@@ -501,6 +558,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func hideAll() {
+        resetPinnedOutsideClickCount()
         saveStickerState()
         advancePresentationGeneration()
         visibilityState = .hidden
@@ -516,6 +574,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func restoreAll() {
+        resetPinnedOutsideClickCount()
         advancePresentationGeneration()
         visibilityState = .pinned
         restoreHotspotRequiresReentry = false
@@ -612,6 +671,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func showPreviewFromHidden() {
         guard visibilityState == .hidden else { return }
 
+        resetPinnedOutsideClickCount()
         cancelPreviewShowFromHidden()
         advancePresentationGeneration()
         visibilityState = .peek
@@ -630,6 +690,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func hidePreviewFromHidden() {
         guard visibilityState == .peek || visibilityState == .hidden else { return }
 
+        resetPinnedOutsideClickCount()
         cancelPreviewShowFromHidden()
         advancePresentationGeneration()
         visibilityState = .hidden
@@ -961,6 +1022,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         return stickerWindows.contains { window in
             window.isVisible && window.containsStableMouseLocation(location)
+        }
+    }
+
+    private func isFloatNoteLocation(_ location: NSPoint) -> Bool {
+        if isFloatingUILocation(location) {
+            return true
+        }
+
+        if regionSelectionWindow?.isVisible == true,
+           regionSelectionWindow?.containsMouseLocation(location) == true {
+            return true
+        }
+
+        return liveRegionWindows.contains { window in
+            window.isVisible && window.containsMouseLocation(location)
         }
     }
 
